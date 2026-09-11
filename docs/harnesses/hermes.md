@@ -45,3 +45,7 @@ node scripts/verify-live.mjs --config ~/.config/tool-call-compactor
 ```
 
 That runs the compactor as its own process and checks the parts Hermes will rely on: a compact index, openable batches, full schemas, a real tool call, and search over hidden tools.
+
+## One thing to check on your build
+
+Whether a batch registered *mid-session* becomes callable depends entirely on whether your Hermes build re-reads `tools/list` when a server sends `notifications/tools/list_changed`. opencode does; Claude Code, Codex and Cursor do not. If yours does not, the compactor's index still saves the prefix, and anything you want permanently live should be marked `expose: true` in the config instead of pinned at runtime — `expose` is registered from the first request, so no refresh is needed.

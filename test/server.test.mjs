@@ -97,6 +97,9 @@ async function connect({ config = {}, groups, pool, capabilities, catalog } = {}
   const used = catalog || CATALOG
   const compactor = new Compactor({
     config: cfg,
+    // Same contract as loadConfig: the policy reads what the file said, not
+    // what the defaults filled in.
+    rawOptions: config.options || {},
     pool: pool || makePool(),
     catalog: used,
     groups: groups || autoGroups(used),
@@ -259,13 +262,21 @@ test("describe_group rewrites the batch and persists it to the config file", asy
   assert.equal(saved.groups.git.description, "Everything GitHub: code search, issues, pull requests, reviews and releases.")
 })
 
-test("describe_group trims a description that runs past thirty words", async () => {
+test("describe_group keeps a long description whole and only advises on length", async () => {
   const { client, cfg } = await connect()
   const long = Array.from({ length: 45 }, (_, i) => `word${i}`).join(" ")
   const res = await client.callTool({ name: "describe_group", arguments: { group: "git", description: long } })
-  assert.match(res.content[0].text, /30 of 30 words, trimmed from 45/)
+  assert.match(res.content[0].text, /45 words/, "the count is reported")
   const saved = JSON.parse(readFileSync(cfg.file, "utf8"))
-  assert.equal(saved.groups.git.description.split(" ").length, 30)
+  assert.equal(saved.groups.git.description, long, "nothing was trimmed")
+})
+
+test("a description inside the recommended range is not nagged about", async () => {
+  const { client } = await connect()
+  const fine = Array.from({ length: 40 }, (_, i) => `word${i}`).join(" ")
+  const res = await client.callTool({ name: "describe_group", arguments: { group: "git", description: fine } })
+  assert.match(res.content[0].text, /40 words/)
+  assert.ok(!/measures best/.test(res.content[0].text), "40 words is inside 20-100")
 })
 
 test("renaming a batch moves its id and the advertised tool name", async () => {
@@ -281,7 +292,7 @@ test("renaming a batch moves its id and the advertised tool name", async () => {
 test("a small batch is exposed natively after it is fetched", async () => {
   const { client } = await connect()
   const res = await client.callTool({ name: "see_tools_shell", arguments: {} })
-  assert.match(res.content[0].text, /Registered \d+ tools natively/)
+  assert.match(res.content[0].text, /in your tool list for the rest of the session/)
   const names = (await client.listTools()).tools.map((t) => t.name)
   assert.ok(names.includes("shell__bash"), `expected shell__bash in ${names}`)
   const called = await client.callTool({ name: "shell__bash", arguments: { command: "true" } })
@@ -291,7 +302,7 @@ test("a small batch is exposed natively after it is fetched", async () => {
 test("a batch over the exposure budget is not registered, so the saving survives", async () => {
   const { client } = await connect({ config: { options: { dynamicBudget: 100 } } })
   const res = await client.callTool({ name: "see_tools_git", arguments: {} })
-  assert.match(res.content[0].text, /Execute with call_tool/)
+  assert.match(res.content[0].text, /over the 100-token persist budget/)
   const names = (await client.listTools()).tools.map((t) => t.name)
   assert.ok(!names.some((n) => n.startsWith("git__")))
 })
@@ -362,6 +373,163 @@ test("a group with no catalog entry still works, by asking the server live", asy
 test("estimateTokens is the same measure for index and hidden tools", () => {
   const token = estimateTokens({ name: "x", description: "y", inputSchema: { type: "object" } })
   assert.ok(Number.isInteger(token) && token > 0)
+})
+
+// ------------------------------------------------------- pass-through batches
+
+/** The auto-derived batches with per-batch overrides applied. */
+function grouped(patches = {}) {
+  const base = autoGroups(CATALOG)
+  for (const [id, patch] of Object.entries(patches)) base[id] = { ...base[id], ...patch }
+  return base
+}
+
+const liveNames = async (client) => (await client.listTools()).tools.map((t) => t.name)
+
+test("a batch marked expose:true is pass-through: live from the very first request", async () => {
+  const { client } = await connect({ groups: grouped({ shell: { expose: true } }) })
+  const names = await liveNames(client)
+  assert.ok(names.includes("shell__bash"), `expected shell__bash in ${names}`)
+  assert.ok(!names.includes("see_tools_shell"), "an exposed batch needs no fetch tool")
+  assert.ok(names.includes("see_tools_git"), "the other batches are still compacted")
+
+  const called = await client.callTool({ name: "shell__bash", arguments: { command: "true" } })
+  assert.equal(called.isError, undefined)
+  assert.match(called.content[0].text, /ran builtin\.bash/)
+})
+
+test("expose:true is registered on every tool list, so the prefix cannot drift", async () => {
+  const { client } = await connect({ groups: grouped({ shell: { expose: true } }) })
+  const first = JSON.stringify((await client.listTools()).tools)
+  const second = JSON.stringify((await client.listTools()).tools)
+  assert.equal(first, second, "a stable tool list is what a prompt cache needs")
+})
+
+// ------------------------------------------------------------ persist policy
+
+test("persist: agent leaves fetched schemas out until the agent asks for them", async () => {
+  const { client } = await connect({ config: { options: { persist: "agent" } } })
+  const first = await client.callTool({ name: "see_tools_shell", arguments: {} })
+  assert.match(first.content[0].text, /## bash \(builtin\)/, "the schemas still come back on the fetch")
+  assert.match(first.content[0].text, /persist_group \{group, persist: true\}/)
+  assert.ok(!(await liveNames(client)).includes("shell__bash"), "nothing is registered until asked")
+
+  const pinned = await client.callTool({ name: "persist_group", arguments: { group: "shell", persist: true } })
+  assert.match(pinned.content[0].text, /kept 1 tool live as shell__<tool>/)
+  assert.ok((await liveNames(client)).includes("shell__bash"))
+
+  const dropped = await client.callTool({ name: "persist_group", arguments: { group: "shell", persist: false } })
+  assert.match(dropped.content[0].text, /fetch-only/)
+  assert.ok(!(await liveNames(client)).includes("shell__bash"))
+})
+
+test("persist: auto keeps a fetched batch live for the session", async () => {
+  const { client, compactor } = await connect({ config: { options: { persist: "auto" } } })
+  await client.callTool({ name: "see_tools_shell", arguments: {} })
+  assert.ok((await liveNames(client)).includes("shell__bash"))
+  assert.ok(compactor.pinned.has("shell"), "an auto-registered batch is still tracked as pinned")
+})
+
+test("see_tools_persistent_<batch> is the spelling an agent reaches for", async () => {
+  const { client } = await connect({ config: { options: { persist: "agent" } } })
+  const res = await client.callTool({ name: "see_tools_persistent_shell", arguments: {} })
+  assert.match(res.content[0].text, /pinned live/)
+  assert.ok((await liveNames(client)).includes("shell__bash"))
+})
+
+test("persist: off refuses an agent pin, but a permanent one still lands", async () => {
+  const { client } = await connect({ config: { options: { persist: "off" } } })
+  const refused = await client.callTool({ name: "persist_group", arguments: { group: "shell", persist: true } })
+  assert.match(refused.content[0].text, /persist=off/)
+  assert.ok(!(await liveNames(client)).includes("shell__bash"))
+
+  const forced = await client.callTool({ name: "persist_group", arguments: { group: "shell", persist: true, permanent: true } })
+  assert.match(forced.content[0].text, /kept 1 tool live/)
+  assert.ok((await liveNames(client)).includes("shell__bash"))
+})
+
+test("permanent: true writes expose into the config, so a restart starts live", async () => {
+  const { client, cfg } = await connect({ config: { options: { persist: "agent" } } })
+  const res = await client.callTool({ name: "persist_group", arguments: { group: "shell", persist: true, permanent: true } })
+  assert.match(res.content[0].text, /saved to/)
+  const written = JSON.parse(readFileSync(cfg.file, "utf8"))
+  assert.equal(written.groups.shell.expose, true)
+
+  // Nothing but that file drives the next session.
+  const restarted = await connect({ groups: { ...autoGroups(CATALOG), ...written.groups } })
+  assert.ok((await liveNames(restarted.client)).includes("shell__bash"))
+})
+
+test("fetching a live batch twice does not pay for the schemas twice", async () => {
+  const { client } = await connect()
+  await client.callTool({ name: "see_tools_shell", arguments: {} })
+  const again = await client.callTool({ name: "see_tools_shell", arguments: {} })
+  assert.doesNotMatch(again.content[0].text, /## bash \(builtin\)/)
+  assert.match(again.content[0].text, /already live under shell__/)
+})
+
+test("list_groups says which batches are already live", async () => {
+  const { client } = await connect({ groups: grouped({ shell: { expose: true } }), config: { options: { persist: "agent" } } })
+  const text = (await client.callTool({ name: "list_groups", arguments: {} })).content[0].text
+  assert.match(text, /\[live\]/)
+  assert.doesNotMatch(text, /Git and GitHub \[git\][^\n]*\[live\]/)
+  assert.match(text, /persist_group \{group, persist: true\}/)
+})
+
+test("the session briefing tells the agent the tools are not in its tool list", async () => {
+  const { client } = await connect()
+  const text = client.getInstructions() || ""
+  assert.match(text, /Your tool list is compacted/)
+  assert.match(text, /2 batches, not the 21 tools across 2 servers/, "it names what it is hiding")
+  assert.match(text, /None of them are in your tool list/)
+  assert.match(text, /FINDING A TOOL/)
+  assert.match(text, /list_groups/, "the index is the first step")
+  assert.match(text, /search_tools/, "search is the fallback before giving up")
+  assert.match(text, /see_tools_<batch>/, "fetching is named by its advertised form")
+  assert.match(text, /call_tool \{server, tool, arguments\}/)
+  assert.match(text, /DO NOT:/, "it says what not to do")
+  assert.match(text, /fetch a batch to browse it/, "the expensive mistake is called out")
+  assert.match(text, /describe_group/, "the agent is told it maintains the index")
+})
+
+test("the briefing matches the persist policy it is running under", async () => {
+  const agent = await connect({ config: { options: { persist: "agent" } } })
+  assert.match(agent.client.getInstructions(), /persist_group \{group, persist: true\}/)
+
+  const off = await connect({ config: { options: { persist: "off" } } })
+  assert.match(off.client.getInstructions(), /never enter your tool list/)
+
+  const auto = await connect({ config: { options: { persist: "auto", persistBudget: 2500 } } })
+  assert.match(auto.client.getInstructions(), /under 2500 tokens/)
+})
+
+test("list_groups lists the tool names inside each batch", async () => {
+  const { client } = await connect()
+  const text = (await client.callTool({ name: "list_groups", arguments: {} })).content[0].text
+  assert.match(text, /create_issue, github_op_0/, "names, not just prose")
+  assert.match(text, /\+\d+ more — list_groups \{group: "git"\}/, "big batches say how to see the rest")
+  assert.match(text, /bash/, "a small batch lists all of its tools with no overflow")
+})
+
+test("list_groups {group} shows one batch's tools in full", async () => {
+  const { client } = await connect()
+  const text = (await client.callTool({ name: "list_groups", arguments: { group: "git" } })).content[0].text
+  for (let i = 0; i < 18; i += 1) {
+    assert.match(text, new RegExp(`github::github_op_${i}\\b`), `github_op_${i} is listed`)
+  }
+  assert.match(text, /20 tools/)
+  assert.match(text, /Fetch the schemas with see_tools_git/)
+
+  const missing = await client.callTool({ name: "list_groups", arguments: { group: "nope" } })
+  assert.match(missing.content[0].text, /Unknown batch "nope"/)
+})
+
+test("an exposed batch's detail page says its tools are already live", async () => {
+  const { client } = await connect({ groups: grouped({ shell: { expose: true } }) })
+  const text = (await client.callTool({ name: "list_groups", arguments: { group: "shell" } })).content[0].text
+  assert.match(text, /pass-through, already in your tool list/)
+  assert.match(text, /live as shell__<tool>/)
+  assert.doesNotMatch(text, /Fetch the schemas/)
 })
 
 test.after(() => {
