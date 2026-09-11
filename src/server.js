@@ -1,9 +1,11 @@
 // The compactor MCP server.
 //
 // It advertises a handful of tiny tools and, behind them, every tool of every
-// configured MCP server. The agent sees thirty words per group instead of a
-// thousand words per server, and pays for the real schemas only when a group is
-// actually needed.
+// configured MCP server. The agent sees one description per batch instead of a
+// thousand words per server, and pays for the real schemas only when a batch is
+// actually needed. It also ships the briefing (`instructionsFor`) that tells the
+// agent the tools are not in its tool list and how to reach them — without it the
+// index is a room with no door.
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
@@ -19,25 +21,28 @@ import {
   toolsInGroup,
   toolIndex,
   wordCount,
-  MAX_WORDS,
+  outsideRecommended,
+  WORDS_RECOMMENDED,
 } from "./groups.js"
 import { compressResult, clampSchema, textBytes } from "./compress.js"
 import { estimateTokens } from "./catalog.js"
 import { reportLines } from "./metrics.js"
-import { saveConfig } from "./config.js"
+import { saveConfig, persistPolicy, LEGACY_DYNAMIC_BUDGET } from "./config.js"
 
 export const VERSION = "0.1.0"
 
-/** Dynamic registration budget. Registering a group's real tools makes later
- *  calls frictionless, but it puts those schemas back in the prefix for the rest
- *  of the session — so only groups small enough to be worth it get exposed. */
-export const DYNAMIC_TOKEN_BUDGET = 4_000
+/** Registration budget. Registering a group's real tools makes later calls
+ *  frictionless, but it puts those schemas back in the prefix for the rest of
+ *  the session — so the default policy only registers what stays cheap. Set
+ *  `options.persistBudget` to change it, or `0` for no cap at all. */
+export const DYNAMIC_TOKEN_BUDGET = LEGACY_DYNAMIC_BUDGET
 
 const FETCH_SCHEMA = {
   type: "object",
   properties: {
     tool: { type: "string", description: "Return only this tool's full schema instead of the whole group." },
     names_only: { type: "boolean", description: "Return just tool names and one-line summaries." },
+    persist: { type: "boolean", description: "Register this batch's tools in the tool list for the rest of the session (true), or drop them (false)." },
   },
   additionalProperties: false,
 }
@@ -45,8 +50,16 @@ const FETCH_SCHEMA = {
 const CORE_TOOLS = [
   {
     name: "list_groups",
-    description: "List every tool group with its description and size. Start here.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    description:
+      "The index: every batch with its description, its size, and the names of the tools inside it. Start here. " +
+      "Pass a group to see one batch's tools in full.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        group: { type: "string", description: "Optional. Show this one batch's tools in full instead of the index." },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: "search_tools",
@@ -78,13 +91,19 @@ const CORE_TOOLS = [
   },
   {
     name: "describe_group",
-    description: "Retitle a batch or rewrite its description in thirty words or fewer. Renames see_tools_<id> when the title changes.",
+    description:
+      "Rewrite a batch's description (or retitle it) so the index matches what is really inside. " +
+      `${WORDS_RECOMMENDED[0]}–${WORDS_RECOMMENDED[1]} words measures best; there is no hard limit. ` +
+      "Renames see_tools_<id> when the title changes.",
     inputSchema: {
       type: "object",
       properties: {
         group: { type: "string", description: "Batch id or title from list_groups." },
         title: { type: "string", description: "New short title; sets the see_tools_<id> name." },
-        description: { type: "string", description: "New description, thirty words maximum." },
+        description: {
+          type: "string",
+          description: `New description. Name the capabilities an agent would not guess from the title; ${WORDS_RECOMMENDED[0]}–${WORDS_RECOMMENDED[1]} words is the sweet spot.`,
+        },
       },
       required: ["group"],
       additionalProperties: false,
@@ -103,17 +122,86 @@ const CORE_TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "persist_group",
+    description:
+      "Keep a batch's tools in the tool list for the rest of the session, or drop them. Call with no `persist` to just ask.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        group: { type: "string", description: "Batch id or title from list_groups." },
+        persist: { type: "boolean", description: "true keeps the batch's tools live; false drops them again." },
+        permanent: { type: "boolean", description: "Also write it to the config, so it applies to every future session." },
+      },
+      required: ["group"],
+      additionalProperties: false,
+    },
+  },
 ]
 
-const INSTRUCTIONS =
-  "Tools are compacted into groups to save context. Call list_groups for the index, " +
-  "see_tools_<group> to fetch only the schemas you need, then call_tool to execute. " +
-  "Do not fetch a group you are not about to use."
+/** The briefing the harness splices into the session's system prompt. This is
+ *  the whole interface contract: an agent that never learns the tools are not in
+ *  its tool list will simply fail to find them, and the index looks like a
+ *  broken tool set rather than a fast one. It rides in the cached prefix, so it
+ *  is written to be read once and obeyed, not skimmed. */
+function instructionsFor(policy, { batches = 0, tools = 0, servers = 0 } = {}) {
+  const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`
+  const lines = [
+    "TOOL ACCESS — HOW THIS WORKSPACE IS WIRED",
+    "",
+    `Your tool list is compacted. It carries ${plural(batches, "batch", "batches")}, not the ` +
+      `${plural(tools, "tool", "tools")} across ${plural(servers, "server", "servers")} that they stand for. ` +
+      "Every one of those tools still runs. None of them are in your tool list. You reach them through this server.",
+    "",
+    "FINDING A TOOL — in this order:",
+    "1. list_groups — the index. Each batch shows its title, its description, and the names of the tools " +
+      "inside it. Call it first whenever you are unsure where something lives.",
+    `2. search_tools {query} — matches all ${tools} hidden tools by name, description and server. Call it the ` +
+      "moment the index does not obviously cover what you need, and always before you report to the user that " +
+      "a tool does not exist. A miss here is the only evidence that something is genuinely absent.",
+    "3. see_tools_<batch> — the full JSON schemas for one batch. Call it when you are about to use one of its " +
+      "tools, and not before.",
+    "",
+    "RUNNING A TOOL: call_tool {server, tool, arguments}, with arguments built from the schema " +
+      "see_tools_<batch> returned. Do not guess parameter names — the schema is one call away.",
+    "",
+    "DO NOT:",
+    "• fetch a batch to browse it. A fetch returns every schema in the batch and stays in your history for the " +
+      "rest of the session. It is the most expensive call you can make here.",
+    "• guess a tool name and call it. One search_tools costs a line; one wrong call_tool costs a turn.",
+    "• read a missing entry as a missing tool. Everything the user configured is reachable through the index.",
+    "• pre-fetch batches \"to be safe\" before starting. Open the one batch the task actually needs.",
+    "",
+    "MAINTAINING THE INDEX: if a batch's description does not match what you find inside it, call " +
+      `describe_group and rewrite it — the wording you leave is what you read next session. ` +
+      `${WORDS_RECOMMENDED[0]}–${WORDS_RECOMMENDED[1]} words measures best; there is no hard limit.`,
+    "",
+  ]
+  if (policy.mode === "agent") {
+    lines.push(
+      "PERSISTENCE: fetched schemas stay out of your tool list unless you ask for them. Call persist_group " +
+        "{group, persist: true} for a batch you will keep using this session — its tools then register, and " +
+        "later calls skip the fetch.",
+    )
+  } else if (policy.mode === "auto") {
+    lines.push(
+      "PERSISTENCE: a fetched batch joins your tool list for the rest of the session" +
+        (policy.budget ? ` while it stays under ${policy.budget} tokens` : "") +
+        "; larger batches stay fetch-only and go through call_tool.",
+    )
+  } else {
+    lines.push("PERSISTENCE: fetched schemas never enter your tool list. Fetch, then call_tool.")
+  }
+  return lines.join("\n")
+}
 
 export class Compactor {
-  constructor({ config, pool, catalog, groups, metrics, log = () => {} }) {
+  constructor({ config, pool, catalog, groups, metrics, rawOptions, log = () => {} }) {
     this.config = config
     this.options = config.options
+    // The policy is read from the options the file actually contains, so a
+    // config that predates `persist` keeps the budget it was written with.
+    this.policy = persistPolicy(rawOptions ?? config.rawOptions ?? config.options)
     this.pool = pool
     this.catalog = catalog
     this.groups = groups
@@ -121,15 +209,37 @@ export class Compactor {
     this.log = log
     this.index = toolIndex(catalog)
     this.dynamic = new Map() // exposed name -> { group, server, tool }
-    this.exposedGroups = new Set()
+    this.exposedByKey = new Map() // "server::tool" -> exposed name
+    this.registered = new Set() // batches whose tools are in the tool list now
+    this.pinned = new Set() // batches kept live by the persist policy
     this.advertisedRevision = 0
     this.lastRecordedRevision = -1
     this.startedAt = Date.now()
+    // The briefing counts what the agent cannot see, so it has to be computed
+    // before the Server exists — `exposedByKey` is not filled in until
+    // syncExposed runs below.
+    const exposedGroups = Object.values(this.groups).filter((group) => group.expose)
+    const exposedTools = exposedGroups.reduce(
+      (n, group) => n + toolsInGroup(group, this.catalog, this.index).length,
+      0,
+    )
     this.mcp = new Server(
       { name: "tool-call-compactor", version: VERSION },
-      { capabilities: { tools: { listChanged: true } }, instructions: INSTRUCTIONS },
+      {
+        capabilities: { tools: { listChanged: true } },
+        instructions: instructionsFor(this.policy, {
+          batches: Object.keys(this.groups).length - exposedGroups.length,
+          tools: Math.max(0, this.index.size - exposedTools),
+          // Counted from the index, not the config: an agent asking "how many
+          // servers are behind this" cares about what is reachable.
+          servers: new Set([...this.index.values()].map((tool) => tool.server)).size,
+        }),
+      },
     )
     this.registerHandlers()
+    // Pass-through batches are live from here on, before any request arrives —
+    // that is what keeps the advertised tool list identical on request one.
+    this.syncExposed()
   }
 
   // ---------------------------------------------------------------- tool list
@@ -145,9 +255,49 @@ export class Compactor {
     return CORE_TOOLS.map((t) => ({ ...t }))
   }
 
+  /** A batch marked `expose: true` is pass-through: its tools are advertised as
+   *  real tools from the very first request instead of hiding behind a fetch.
+   *  Registering at boot rather than on demand is the point — the tool list is
+   *  then byte-identical on every request, which is what a provider's prefix
+   *  cache needs to keep hitting. */
+  syncExposed() {
+    for (const [id, group] of Object.entries(this.groups)) {
+      if (!group?.expose || this.registered.has(id)) continue
+      const tools = this.index.size ? toolsInGroup(group, this.catalog, this.index) : []
+      if (!tools.length) {
+        this.log(`batch "${id}" is expose:true but has no catalogued tools — run \`tcc scan\` to snapshot them`)
+        continue
+      }
+      this.registerGroup(id, tools)
+    }
+  }
+
+  /** The name a batch's tool takes once it is registered. Two servers can share
+   *  a tool name, and MCP names must be unique, so the server is folded in for
+   *  the ones that clash. */
+  exposedName(groupId, tool, counts) {
+    return counts?.get(tool.name) > 1 ? `${groupId}__${tool.server}__${tool.name}` : `${groupId}__${tool.name}`
+  }
+
+  registerGroup(id, tools) {
+    const counts = new Map()
+    for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) || 0) + 1)
+    let added = 0
+    for (const tool of tools) {
+      const exposed = this.exposedName(id, tool, counts)
+      if (this.dynamic.has(exposed)) continue
+      this.dynamic.set(exposed, { group: id, server: tool.server, tool: tool.name })
+      this.exposedByKey.set(`${tool.server}::${tool.name}`, exposed)
+      added += 1
+    }
+    if (added) this.registered.add(id)
+    return added
+  }
+
   groupToolList() {
     const out = []
     for (const [id, group] of Object.entries(this.groups)) {
+      if (this.registered.has(id)) continue // already live as real tools; a fetch tool would be dead weight
       const count = this.groupToolCount(id)
       const title = group.title || titleFor(id)
       out.push({
@@ -174,6 +324,7 @@ export class Compactor {
   }
 
   toolList() {
+    this.syncExposed()
     return [...this.coreToolList(), ...this.groupToolList(), ...this.dynamicToolList()]
   }
 
@@ -186,9 +337,7 @@ export class Compactor {
     let hiddenTools = 0
     let hiddenTokens = 0
     for (const [key, tool] of this.index) {
-      const server = tool.server
-      const exposedName = [...this.dynamic.entries()].find(([, e]) => `${e.server}::${e.tool}` === key)?.[0]
-      if (exposedName) continue
+      if (this.exposedByKey.has(key)) continue
       hiddenTools += 1
       hiddenTokens += tool.tokens || estimateTokens(tool)
     }
@@ -204,43 +353,60 @@ export class Compactor {
     return { tools: tools.length, tokens, hiddenTools, hiddenTokens }
   }
 
-  /** After a group's schemas have been fetched, expose its real tools natively —
-   *  but only when the client can refresh its tool list, and only for groups
-   *  small enough that re-adding them does not undo the saving. */
-  async maybeExpose(groupId, tools) {
-    if (!this.options.dynamic || this.exposedGroups.has(groupId)) return { exposed: 0, reason: "off" }
-    // `true` means the default policy — register a batch only while its schemas
-    // stay cheap. "always" overrides that and registers whatever was fetched.
-    if (this.options.dynamic !== "always") {
-      const cost = tools.reduce((n, t) => n + (t.tokens || estimateTokens(t)), 0)
-      if (cost > (this.options.dynamicBudget ?? DYNAMIC_TOKEN_BUDGET)) {
-        return { exposed: 0, reason: "too-large", cost }
-      }
+  /** Announce a changed tool list. There is no client capability to check:
+   *  tools.listChanged is something a *server* announces, and clients never
+   *  declare it. A client that ignores the notification simply never sees the
+   *  extra tools and keeps using call_tool, which still works — so announcing is
+   *  always safe. */
+  async notifyToolList() {
+    this.advertisedRevision += 1
+    try {
+      await this.mcp.sendToolListChanged()
+    } catch (err) {
+      this.log(`tool list changed notification failed: ${err.message}`)
     }
-    // There is no client capability to check: tools.listChanged is something a
-    // *server* announces, and clients never declare it. A client that ignores
-    // the notification simply never sees the extra tools and keeps using
-    // call_tool, which still works — so announcing is always safe.
-    const counts = new Map()
-    for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) || 0) + 1)
-    let added = 0
-    for (const tool of tools) {
-      const exposed = counts.get(tool.name) > 1 ? `${groupId}__${tool.server}__${tool.name}` : `${groupId}__${tool.name}`
-      if (this.dynamic.has(exposed)) continue
-      this.dynamic.set(exposed, { group: groupId, server: tool.server, tool: tool.name })
-      added += 1
+    this.recordAdvertised()
+  }
+
+  /** The persist policy, applied to one fetched batch: does its schema come back
+   *  to live in the tool list for the rest of the session?
+   *
+   *  - `off`   — never; the agent keeps going through call_tool.
+   *  - `auto`  — yes, while the batch stays inside `persistBudget`.
+   *  - `agent` — only when the agent asked (`persist: true` / `persist_group`).
+   *
+   *  An explicit request outranks the budget: the agent has seen the cost and
+   *  decided. `persist: false` is an explicit un-registration. */
+  async maybeExpose(groupId, tools, { persist } = {}) {
+    if (persist === false) return this.unregisterGroup(groupId)
+    if (this.registered.has(groupId)) return { exposed: 0, reason: "already" }
+    const asked = persist === true || this.pinned.has(groupId)
+    if (this.policy.mode === "off") return { exposed: 0, reason: "persist-off" }
+    if (this.policy.mode === "agent" && !asked) return { exposed: 0, reason: "agent-decides" }
+    const cost = tools.reduce((n, t) => n + (t.tokens || estimateTokens(t)), 0)
+    if (!asked && this.policy.budget > 0 && cost > this.policy.budget) {
+      return { exposed: 0, reason: "over-budget", cost, budget: this.policy.budget }
     }
-    this.exposedGroups.add(groupId)
-    if (added) {
-      this.advertisedRevision += 1
-      try {
-        await this.mcp.sendToolListChanged()
-      } catch (err) {
-        this.log(`tool list changed notification failed: ${err.message}`)
-      }
-      this.recordAdvertised()
+    const added = this.registerGroup(groupId, tools)
+    // `pinned` means "kept live by this session" as opposed to a batch the
+    // config marks `expose: true`, which is live in every session.
+    this.pinned.add(groupId)
+    if (added) await this.notifyToolList()
+    return { exposed: added, reason: "registered", cost }
+  }
+
+  async unregisterGroup(groupId) {
+    let removed = 0
+    for (const [exposed, entry] of [...this.dynamic]) {
+      if (entry.group !== groupId) continue
+      this.dynamic.delete(exposed)
+      this.exposedByKey.delete(`${entry.server}::${entry.tool}`)
+      removed += 1
     }
-    return { exposed: added, reason: "registered" }
+    this.registered.delete(groupId)
+    this.pinned.delete(groupId)
+    if (removed) await this.notifyToolList()
+    return { exposed: 0, removed, reason: "unregistered" }
   }
 
   // ----------------------------------------------------------------- handlers
@@ -267,7 +433,7 @@ export class Compactor {
     if (entry) return this.invokeDynamic(entry, args)
     switch (name) {
       case "list_groups":
-        return this.tListGroups()
+        return this.tListGroups(args)
       case "search_tools":
         return this.tSearchTools(args)
       case "call_tool":
@@ -275,9 +441,16 @@ export class Compactor {
         return this.tCallTool(args)
       case "describe_group":
         return this.tDescribeGroup(args)
+      case "persist_group":
+      case "pin_group":
+        return this.tPersistGroup(args)
       case "fetch_group":
         return this.tFetchGroup(args.group, args)
       default: {
+        // Checked before see_tools_<group>, which would otherwise read the
+        // "persistent_" part as a batch id.
+        const persistent = name.match(/^see_tools?_persistent?_(.+)$/)
+        if (persistent) return this.tPersistGroup({ ...args, group: persistent[1], persist: args.persist ?? true })
         // see_tools_<group> is the advertised name; see_tool_<group> is accepted
         // too, because that is the spelling everyone types first.
         const scoped = name.match(/^see_tools?_(.+)$/)
@@ -294,24 +467,82 @@ export class Compactor {
   groupLine(id) {
     const group = this.groups[id]
     const count = this.groupToolCount(id)
-    return `${describeLine(id, group, count)}${group.servers?.length ? ` [${group.servers.join(", ")}]` : ""}`
+    const status = !this.registered.has(id) ? "" : this.pinned.has(id) ? " [pinned live]" : " [live]"
+    return `${describeLine(id, group, count)}${status}${group.servers?.length ? ` [${group.servers.join(", ")}]` : ""}`
   }
 
-  tListGroups() {
+  /** The names inside a batch. This is the recall fix: a description is prose and
+   *  can miss a capability the agent needed, but a name is the exact word it is
+   *  looking for. Names belong here rather than in the prefix — a tool result is
+   *  history and costs nothing per request. */
+  toolNames(id) {
+    const group = this.groups[id]
+    if (!group) return []
+    return toolsInGroup(group, this.catalog, this.index)
+      .map((tool) => tool.name)
+      .sort()
+  }
+
+  namesLine(id, limit = 14) {
+    const names = this.toolNames(id)
+    if (!names.length) return null
+    const shown = names.slice(0, limit)
+    const more = names.length - shown.length
+    return `        ${shown.join(", ")}${more > 0 ? `, +${more} more — list_groups {group: "${id}"}` : ""}`
+  }
+
+  tGroupDetail(rawId) {
+    const found = findGroup(this.groups, rawId)
+    if (!found) {
+      const ids = Object.keys(this.groups)
+      return this.text(`Unknown batch "${rawId}". Available: ${ids.join(", ") || "(none)"}`)
+    }
+    const { id, group } = found
+    const tools = toolsInGroup(group, this.catalog, this.index)
+    const words = wordCount(group.description || "")
+    const lines = [
+      `"${id}" — ${group.title}`,
+      group.description || "(no description yet)",
+      `${tools.length} tool${tools.length === 1 ? "" : "s"}` +
+        (group.expose ? " · pass-through, already in your tool list" : "") +
+        (group.servers?.length ? ` · servers: ${group.servers.join(", ")}` : ""),
+      "",
+      ...tools.map((t) => `  ${t.server}::${t.name}${t.description ? ` — ${clampWords(t.description, 14)}` : ""}`),
+      "",
+      group.expose
+        ? `These are live as ${id}__<tool>; call them directly.`
+        : `Fetch the schemas with see_tools_${id}, then run one with call_tool.`,
+      outsideRecommended(words)
+        ? `This description is ${words} words; ${WORDS_RECOMMENDED[0]}–${WORDS_RECOMMENDED[1]} measures best. describe_group can rewrite it.`
+        : null,
+    ].filter((line) => line !== null)
+    return this.text(lines.join("\n"))
+  }
+
+  tListGroups({ group } = {}) {
+    if (group) return this.tGroupDetail(group)
     const ids = Object.keys(this.groups)
     if (!ids.length) {
       return this.text(
         "No groups are configured and no servers were detected. Add servers to tcc.config.json, then run `tcc init`.",
       )
     }
-    const hidden = this.index.size
+    const live = [...this.registered]
+    const hidden = [...this.index.keys()].filter((key) => !this.exposedByKey.has(key)).length
     const lines = [
-      `${ids.length} groups, ${hidden} tools hidden behind them.`,
+      `${ids.length} batches, ${hidden} tools hidden behind them. Each batch lists its tools.`,
       "",
-      ...ids.map((id) => this.groupLine(id)),
+      ...ids.flatMap((id) => [this.groupLine(id), this.namesLine(id)]).filter((line) => line !== null),
       "",
-      "Fetch one with see_tools_<group>, or call_tool directly if you already know the tool.",
-    ]
+      "Fetch one batch's schemas with see_tools_<group>, then run a tool with call_tool. If the index does",
+      "not obviously cover what you need, search_tools {query} scans all of it before you conclude anything.",
+      live.length ? `Live batches (tools already in your tool list): ${live.join(", ")}.` : null,
+      this.policy.mode === "agent"
+        ? "A fetched batch stays fetch-only until you call persist_group {group, persist: true}."
+        : this.policy.mode === "off"
+          ? "persist is off: fetched schemas are never added to your tool list; use call_tool."
+          : `Fetched batches stay live for the session${this.policy.budget ? ` while under ${this.policy.budget} tokens` : ""}.`,
+    ].filter((line) => line !== null)
     return this.text(lines.join("\n"))
   }
 
@@ -363,13 +594,14 @@ export class Compactor {
     )
   }
 
-  async tFetchGroup(rawId, { tool, names_only } = {}) {
+  async tFetchGroup(rawId, { tool, names_only, persist } = {}) {
     const found = findGroup(this.groups, rawId)
     if (!found) {
       const ids = Object.keys(this.groups)
       return this.text(`Unknown group "${rawId}". Available: ${ids.join(", ") || "(none)"}`)
     }
     const { id, group } = found
+    const wasLive = this.registered.has(id)
     const tools = await this.toolsForGroup(id, group)
     if (!tools.length) {
       const servers = (group.servers || []).join(", ") || "none"
@@ -385,15 +617,23 @@ export class Compactor {
       bytes: JSON.stringify(tools).length,
       tokens: totalTokens,
       namesOnly: !!names_only,
+      persisted: wasLive || this.registered.has(id),
     })
-    const exposed = names_only ? { exposed: 0, reason: "names-only" } : await this.maybeExpose(id, tools)
+    const exposed = names_only ? { exposed: 0, reason: "names-only" } : await this.maybeExpose(id, tools, { persist })
+    const liveNow = this.registered.has(id)
     const header = [
       `# ${group.title || titleFor(id)} [${id}] — ${tools.length} tools, ~${totalTokens} tokens of schema`,
       group.description,
       group.servers?.length ? `Servers: ${group.servers.join(", ")}` : null,
-      exposed.exposed
-        ? `Registered ${exposed.exposed} tools natively — call them as ${id}__<tool> from now on.`
-        : `Execute with call_tool {server, tool, arguments}.`,
+      liveNow
+        ? `These tools are in your tool list for the rest of the session — call them as ${id}__<tool>.`
+        : exposed.reason === "agent-decides"
+          ? "Not added to your tool list. Call persist_group {group, persist: true} to keep them live, or use call_tool."
+          : exposed.reason === "over-budget"
+            ? `Not added to your tool list: ~${exposed.cost} tokens is over the ${exposed.budget}-token persist budget. Use call_tool.`
+            : exposed.reason === "persist-off"
+              ? "persist is off, so these schemas stay out of your tool list. Execute with call_tool."
+              : "Execute with call_tool {server, tool, arguments}.",
       "",
     ]
       .filter((line) => line !== null)
@@ -409,6 +649,20 @@ export class Compactor {
           `# ${match.name} (${match.server})`,
           match.description || "",
           JSON.stringify(clampSchema(match.inputSchema), null, 1),
+        ].join("\n"),
+      )
+    }
+
+    // Fetched twice: the schemas are already in the tool list, so repeating them
+    // here would pay for the same tokens a second time.
+    if (wasLive && liveNow && !names_only) {
+      return this.text(
+        [
+          ...header,
+          `${tools.length} tools, already live under ${id}__:`,
+          tools.map((t) => this.exposedByKey.get(`${t.server}::${t.name}`) || t.name).join(", "),
+          "",
+          `Call them directly. {tool: "<name>"} returns one schema, {names_only: true} returns one-line summaries.`,
         ].join("\n"),
       )
     }
@@ -444,6 +698,81 @@ export class Compactor {
       }
     }
     return out
+  }
+
+  /** The agent's own switch over the persist policy: keep a batch live, drop
+   *  it, or ask what state it is in. `permanent` writes the choice into
+   *  `expose`, which is the config-level pass-through and outranks the session
+   *  policy — a batch marked `expose: true` is live from the first request of
+   *  every session, whatever `options.persist` says. */
+  async tPersistGroup({ group, persist, permanent } = {}) {
+    const found = findGroup(this.groups, group)
+    if (!found) {
+      return this.text(`Unknown batch "${group}". Available: ${Object.keys(this.groups).join(", ") || "(none)"}`)
+    }
+    const { id, group: g } = found
+    const title = g.title || titleFor(id)
+    const mode = `persist=${this.policy.mode}${this.policy.budget ? ` (budget ${this.policy.budget} tokens)` : ""}`
+    const state = () =>
+      this.registered.has(id) ? (this.pinned.has(id) ? "pinned live for this session" : "live") : "fetch-only"
+
+    if (persist === undefined && permanent === undefined) {
+      return this.text(`"${id}" (${title}): ${state()}, ${mode}.`)
+    }
+
+    const wants = persist === undefined ? true : !!persist
+    const notes = []
+    if (permanent === true) {
+      this.groups[id] = { ...this.groups[id] }
+      if (wants) this.groups[id].expose = true
+      else delete this.groups[id].expose
+      this.config.groups = this.config.groups || {}
+      const entry = { ...(this.config.groups[id] || {}), ...this.groups[id] }
+      if (!wants) delete entry.expose
+      this.config.groups[id] = entry
+      try {
+        notes.push(`saved to ${saveConfig(this.config)}`)
+      } catch (err) {
+        this.log(`could not persist batch: ${err.message}`)
+        notes.push("could not save the config")
+      }
+    }
+
+    if (!wants) {
+      const { removed } = await this.unregisterGroup(id)
+      notes.push(removed ? `dropped ${removed} tools from the tool list` : "was not live")
+      return this.text(`"${id}" (${title}): fetch-only. ${notes.join("; ")}.`)
+    }
+
+    if (this.policy.mode === "off" && permanent !== true) {
+      return this.text(
+        `"${id}" is fetch-only: ${mode}, so the server will not add tools on request. ` +
+          `Set options.persist to "agent" (or "auto") in tcc.config.json, or call this with permanent: true to mark the batch expose:true.`,
+      )
+    }
+
+    const tools = await this.toolsForGroup(id, g)
+    if (!tools.length) {
+      return this.text(`"${id}" has no readable tools — run \`tcc scan\` to snapshot its servers.`)
+    }
+    let result
+    if (permanent === true) {
+      // `expose: true` is a statement about the config, not about this session,
+      // so it outranks the persist policy rather than being gated by it.
+      const added = this.registered.has(id) ? 0 : this.registerGroup(id, tools)
+      if (added) await this.notifyToolList()
+      result = { exposed: added, reason: added ? "registered" : "already" }
+    } else {
+      result = await this.maybeExpose(id, tools, { persist: true })
+    }
+    const n = result.exposed
+    if (n) notes.unshift(`kept ${n} tool${n === 1 ? "" : "s"} live as ${id}__<tool>`)
+    else notes.unshift(result.reason === "already" ? "already live" : `not registered (${result.reason})`)
+    this.metrics?.record("persist", { group: id, tools: tools.length, permanent: permanent === true, mode: this.policy.mode })
+    return this.text(
+      `"${id}" (${title}): ${state()}. ${notes.join("; ")}.` +
+        (result.exposed ? " A harness that does not refresh its tool list mid-session will see them on its next restart." : ""),
+    )
   }
 
   async invokeDynamic(entry, args) {
@@ -489,7 +818,7 @@ export class Compactor {
     return out
   }
 
-  tDescribeGroup({ group, title, description }) {
+  async tDescribeGroup({ group, title, description }) {
     const found = findGroup(this.groups, group)
     if (!found) return this.text(`Unknown batch "${group}". Available: ${Object.keys(this.groups).join(", ")}`)
     if (!title && !description) throw new Error("describe_group needs a title or a description")
@@ -504,12 +833,12 @@ export class Compactor {
         if (this.groups[renamed]) {
           notes.push(`title set, but "${renamed}" already exists so see_tools_${id} keeps its name`)
         } else {
+          const wasLive = this.registered.has(id)
+          const tools = wasLive ? toolsInGroup(this.groups[id], this.catalog, this.index) : []
           this.groups[renamed] = this.groups[id]
           delete this.groups[id]
-          for (const [exposed, entry] of [...this.dynamic]) {
-            if (entry.group === id) this.dynamic.delete(exposed)
-          }
-          this.exposedGroups.delete(id)
+          await this.unregisterGroup(id) // the exposed names carry the old id
+          if (wasLive) this.registerGroup(renamed, tools)
           this.config.groups = this.config.groups || {}
           delete this.config.groups[id]
           notes.push(`renamed see_tools_${id} → see_tools_${renamed}`)
@@ -519,10 +848,17 @@ export class Compactor {
     }
 
     if (description) {
-      const before = wordCount(description)
-      const text = clampWords(description, MAX_WORDS)
-      this.groups[id].description = text
-      notes.push(`${Math.min(before, MAX_WORDS)} of ${MAX_WORDS} words${before > MAX_WORDS ? `, trimmed from ${before}` : ""}`)
+      // Deliberately not truncated: whoever is writing this knows what the batch
+      // is for, and the index is theirs to spend. The range is advice only.
+      const words = wordCount(description)
+      this.groups[id].description = String(description).trim()
+      notes.push(
+        `${words} words${
+          outsideRecommended(words)
+            ? ` — ${WORDS_RECOMMENDED[0]}–${WORDS_RECOMMENDED[1]} measures best, but nothing was trimmed`
+            : ""
+        }`,
+      )
     }
 
     this.config.groups = this.config.groups || {}
@@ -569,6 +905,9 @@ export class Compactor {
           uptimeMs: Date.now() - this.startedAt,
           groups: Object.keys(this.groups).length,
           indexedTools: this.index.size,
+          persist: this.policy,
+          registered: [...this.registered],
+          pinned: [...this.pinned],
           exposed: [...this.dynamic.keys()],
           upstreams: this.pool.stats(),
           advertised: this.toolList().length,
