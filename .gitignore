@@ -1,0 +1,10 @@
+node_modules/
+
+# Local state: never commit a real config — it names your servers, and their
+# definitions can carry tokens.
+tcc.config.json
+tcc.config.json.bak*
+catalog.json
+metrics.jsonl
+*.bak-tcc
+*.log
