@@ -71,6 +71,12 @@ DELETE /session/{id}
 
 The first assistant message's `tokens.input + tokens.cache.read` is the prefix. Compare before and after.
 
+## Mid-session tool changes work here
+
+opencode's MCP client subscribes to `notifications/tools/list_changed`, re-lists the server's tools, and republishes them internally — so a batch that the compactor registers mid-session (a `persist_group` call, or an `auto` fetch under the budget) becomes callable on the next step, without a restart. This is not universal: Claude Code and Cursor ignore the same notification.
+
+In opencode v1 this matters because nothing else defers MCP schemas — every server's tools are registered for every request. (v2's Code Mode is the opposite: MCP tools never reach the native tool list by default, which makes the compactor largely redundant there.)
+
 ## Things that bite
 
 - **The prefix, not the history.** Compaction can only summarise history; the tool schemas sit in front of it. A prefix that fills the window makes an auto-compacting session compact forever without ever making progress.

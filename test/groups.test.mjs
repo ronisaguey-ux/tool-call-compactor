@@ -7,11 +7,15 @@ import {
   describeLine,
   findGroup,
   groupIdFor,
+  KNOWN_GROUPS,
+  outsideRecommended,
   slug,
+  synthesizeDescription,
   titleFor,
   toolsInGroup,
   toolIndex,
   wordCount,
+  WORDS_RECOMMENDED,
 } from "../src/groups.js"
 
 const catalog = {
@@ -39,6 +43,35 @@ test("clampWords caps at thirty words by default", () => {
   const long = Array.from({ length: 60 }, (_, i) => `w${i}`).join(" ")
   assert.equal(wordCount(clampWords(long)), 30)
   assert.equal(clampWords("short one"), "short one")
+})
+
+test("a description someone wrote is never clamped, only synthesized ones are", () => {
+  // The built-in defaults are written by a person, deliberately. They must survive
+  // synthesizeDescription whole — truncating them is exactly the behaviour that
+  // made the index too thin for an agent to find things with.
+  for (const [id, known] of Object.entries(KNOWN_GROUPS)) {
+    assert.equal(synthesizeDescription(id, ["whatever-server"]), known.description,
+      `${id} default was altered on the way out`)
+  }
+  const mean = Object.values(KNOWN_GROUPS)
+    .reduce((n, g) => n + wordCount(g.description), 0) / Object.keys(KNOWN_GROUPS).length
+  assert.ok(mean > 30, `defaults average ${mean.toFixed(1)} words, no richer than the old 30-word unit`)
+})
+
+test("every built-in default sits inside the recommended band", () => {
+  const [min, max] = WORDS_RECOMMENDED
+  for (const [id, known] of Object.entries(KNOWN_GROUPS)) {
+    const words = wordCount(known.description)
+    assert.ok(!outsideRecommended(words),
+      `${id} default is ${words} words, outside the ${min}–${max} the project recommends`)
+  }
+})
+
+test("a batch nobody wrote a description for is still synthesized short", () => {
+  const line = synthesizeDescription("some_unknown_thing", ["a-server", "b-server"],
+    ["alpha", "beta", "gamma", "delta", "epsilon"])
+  assert.ok(wordCount(line) <= 30, `synthesized description ran long: ${line}`)
+  assert.match(line, /some unknown thing tools from a-server, b-server: alpha, beta, gamma, delta/)
 })
 
 test("servers aliasing to the same id merge into one batch", () => {

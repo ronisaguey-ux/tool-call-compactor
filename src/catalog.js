@@ -1,9 +1,8 @@
 // The tool catalog: what every upstream can do, snapshotted and cached on disk.
 //
 // Snapshotting is what makes the index possible — we have to know the tools to
-// write a 30-word description of the group that hides them. The snapshot is
-// cached so a cold start does not have to spawn fifteen servers before the agent
-// can ask its first question.
+// describe the group that hides them. The snapshot is cached so a cold start does
+// not have to spawn fifteen servers before the agent can ask its first question.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs"
 import path from "node:path"

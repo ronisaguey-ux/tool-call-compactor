@@ -16,11 +16,11 @@ import {
   snapshot,
   writeCache,
 } from "./catalog.js"
-import { autoGroups, clampWords, coverage, mergeGroups, titleFor, toolsInGroup, toolIndex } from "./groups.js"
+import { autoGroups, clampWords, coverage, findGroup, mergeGroups, titleFor, toolsInGroup, toolIndex } from "./groups.js"
 import { Metrics, reportLines } from "./metrics.js"
 import { Compactor } from "./server.js"
 import { HARNESSES, detectHarnesses, installIntoHarness, readHarness } from "./adapter.js"
-import { defaultConfig, loadConfig, configPath, resolveConfigDir, saveConfig } from "./config.js"
+import { defaultConfig, loadConfig, configPath, persistPolicy, resolveConfigDir, saveConfig } from "./config.js"
 
 const out = (line = "") => process.stdout.write(line + "\n")
 const err = (line) => process.stderr.write(line + "\n")
@@ -239,10 +239,19 @@ function cmdGroups(args) {
   const cache = readCache(cfg.cachePath || defaultCachePath())
   const groups = Object.keys(cfg.groups || {}).length ? cfg.groups : autoGroups(cache || { servers: {} })
   const index = toolIndex(cache || {})
-  out(`${Object.keys(groups).length} batches`)
+  const policy = persistPolicy(cfg.rawOptions || {})
+  const exposed = Object.entries(groups)
+    .filter(([, g]) => g.expose)
+    .map(([id]) => id)
+  out(`${Object.keys(groups).length} batches (persist ${policy.mode}${policy.budget ? `, budget ${policy.budget}` : ""})`)
   for (const [id, group] of Object.entries(groups)) {
     const count = index.size ? toolsInGroup(group, cache, index).length : 0
-    out(`  see_tools_${id.padEnd(16)} ${String(count).padStart(4)} tools  ${(group.title || titleFor(id)).padEnd(18)} ${group.description}`)
+    const kind = group.expose ? `live (${id}__<tool>)` : `see_tools_${id}`
+    out(`  ${kind.padEnd(24)} ${String(count).padStart(4)} tools  ${(group.title || titleFor(id)).padEnd(18)} ${group.description}`)
+  }
+  if (exposed.length) {
+    out("")
+    out(`pass-through batches, always advertised: ${exposed.join(", ")}`)
   }
   if (index.size) {
     const cov = coverage(groups, cache, index)
@@ -250,6 +259,46 @@ function cmdGroups(args) {
     out(`${cov.batched} of ${cov.total} catalogued tools are batched`)
     if (cov.unbatched.length) out(`unbatched (${cov.unbatched.length}): ${cov.unbatched.slice(0, 12).join(", ")} — run \`tcc batch\``)
   }
+}
+
+/** Pass-through: mark a batch so its tools are advertised as real tools from
+ *  the first request of every session, instead of hiding behind a fetch. */
+function cmdExpose(args) {
+  const dir = resolveConfigDir(args.config)
+  const cfg = loadConfig(dir)
+  const wanted = args._[1]
+  const groups = cfg.groups || {}
+  if (!wanted) {
+    const live = Object.entries(groups)
+      .filter(([, g]) => g.expose)
+      .map(([id]) => id)
+    out(live.length ? `pass-through batches: ${live.join(", ")}` : "no pass-through batches")
+    out("usage: tcc expose <batch> [--off] [--config DIR]")
+    return
+  }
+  const found = findGroup(groups, wanted)
+  if (!found) {
+    out(`unknown batch "${wanted}". Available: ${Object.keys(groups).join(", ") || "(none)"}`)
+    process.exitCode = 1
+    return
+  }
+  const on = args.off ? false : true
+  if (on) groups[found.id] = { ...found.group, expose: true }
+  else {
+    const copy = { ...found.group }
+    delete copy.expose
+    groups[found.id] = copy
+  }
+  cfg.groups = groups
+  const cache = readCache(cfg.cachePath || defaultCachePath())
+  const count = cache ? toolsInGroup(groups[found.id], cache, toolIndex(cache)).length : 0
+  saveConfig(cfg, { backup: true })
+  out(
+    on
+      ? `"${found.id}" is now pass-through: its ${count} tools are advertised as ${found.id}__<tool> in every session, from the first request.`
+      : `"${found.id}" is compacted again: the harness will see see_tools_${found.id}.`,
+  )
+  out(`wrote ${configPath(dir)} — restart the harness (or its MCP server) to pick it up.`)
 }
 
 function cmdReport(args) {
@@ -467,6 +516,7 @@ const HELP = `tool-call-compactor — keep tool schemas out of the prompt until 
   tcc scan [--config DIR]                                re-snapshot and show the grouping
   tcc batch [--config DIR]                               rebuild batches, keeping your titles
   tcc groups [--config DIR]                              print the advertised index
+  tcc expose <batch> [--off]                             keep a batch's tools always advertised
   tcc report [--config DIR] [--days N]                   what it saved, from real metrics
   tcc serve [--config DIR] [--workdir PATH]              run the MCP server (a harness runs this)
   tcc selftest                                           exercise the built-in tools
@@ -493,6 +543,8 @@ export async function main(argv) {
       return cmdBatch(args)
     case "groups":
       return cmdGroups(args)
+    case "expose":
+      return cmdExpose(args)
     case "report":
       return cmdReport(args)
     case "serve":

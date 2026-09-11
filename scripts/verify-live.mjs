@@ -92,7 +92,19 @@ check(
 const found = await client.callTool({ name: "search_tools", arguments: { query: "screenshot" } })
 check("search_tools finds hidden tools", /\[/.test(found.content[0].text), found.content[0].text.split("\n")[0])
 
+// 6. Pass-through batches: configured `expose: true`, so their tools are real
+//    tools in the first tool list rather than something behind a fetch.
+const exposed = Object.entries(cfg.groups || {}).filter(([, g]) => g.expose)
+for (const [id] of exposed) {
+  const live = tools.filter((t) => t.name.startsWith(`${id}__`))
+  check(`batch "${id}" is pass-through`, live.length > 0 && !groupTools.some((t) => t.name === `see_tools_${id}`), `${live.length} live tools`)
+}
+
+// 7. The persist policy is what the file says, and asking is never an error.
+const asked = await client.callTool({ name: "persist_group", arguments: { group: groupTools[0]?.name?.replace(/^see_tools_/, "") || "shell" } })
+check("persist_group answers with the batch state", /policy|persist=|fetch-only|live/.test(asked.content[0].text), asked.content[0].text.split("\n")[0])
+
 console.log("")
-console.log(`${hiddenTools} upstream tools behind ${groupTools.length + 4} advertised tools`)
+console.log(`${hiddenTools} upstream tools behind ${tools.length} advertised tools`)
 await client.close()
 process.exit(failures ? 1 : 0)
