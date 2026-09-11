@@ -215,20 +215,7 @@ Since 2026-09-11T02:14:07.221Z:
 
 **Honest caveat:** with prompt caching, most providers bill a cached prefix cheaply, so the *dollar* saving is smaller than the token percentage suggests. The reliable wins are a smaller context window, more room before auto-compaction triggers, and faster first-token latency. The benefit scales with how much schema you were carrying to begin with.
 
-## Prior art
 
-This is not the first tool-schema compactor, and it is not trying to be. It stands on ideas from:
-
-- **[mcmcp](https://github.com/hihouhou/mcmcp)** — a single meta-tool with `list`/`describe`/`call`/`call_batch` modes, response caching, token-bucket rate limiting, config auto-detection, hot reload
-- **[mcp-context-proxy](https://github.com/SergeyMyssak/mcp-context-proxy)** — per-tool stubs, eager/lazy/stub-only modes, response compression, cross-server schema dedup, metrics reporting
-- **[lazy-mcp](https://github.com/glenngillen/lazy-mcp)** — meta-tools with per-server permissions, health monitoring, OAuth PKCE
-- **[dynmcp](https://github.com/omedia/dynmcp)** and **mcp-on-demand** — catalog snapshots with lazy upstream spawn and idle shutdown
-- **[mcp-lean](https://github.com/ryoppippi/mcp-lean)** and the **tldr** gateway — a tiny fixed facade with output field stripping
-- **Claude Code's MCP Tool Search** — the same idea built into a first-party harness
-
-None of their code is used here; several are under licences (AGPL-3.0 among them) that would not permit it. The features are reimplemented from their descriptions, and credited above.
-
-**What is new here** is the batch index: curated, human-or-agent-authored titles and thirty-word descriptions instead of semantic search or keyword guessing. No embedding round-trip, no model in the loop, deterministic, and the agent can rewrite its own index with `describe_group`. And the reach is not limited to MCP servers — built-in harness tools can be batched by the same mechanism.
 
 ## Security
 
