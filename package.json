@@ -1,0 +1,22 @@
+{
+  "name": "tool-call-compactor",
+  "version": "0.1.0",
+  "description": "MCP proxy that replaces hundreds of always-on tool schemas with a tiny index of curated groups, fetched only when the agent needs them.",
+  "type": "module",
+  "bin": {
+    "tcc": "bin/tcc.js",
+    "tool-call-compactor": "bin/tcc.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "serve": "node bin/tcc.js serve",
+    "report": "node bin/tcc.js report"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "license": "MIT"
+}
