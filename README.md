@@ -13,10 +13,14 @@ see_tools_shell, see_tools_files, see_tools_browser, see_tools_git, ...
 
 Each batch carries a **title** and a thirty-word **description** that you (or your agent) write. When the agent needs something in that batch, it calls `see_tools_<batch>` and gets exactly those schemas — once — then calls `call_tool`.
 
+Measured on a real machine with 18 MCP servers attached:
+
 ```
-Before:  492 tools · 545,907 bytes · ~136,000 tokens of schema, every request
-After:    18 tools ·     ~3,100 bytes ·     ~800 tokens, plus 4.5k when you actually open a batch
+Before:  518 tools · 489,905 bytes · ~122,000 tokens of schema on every request
+After:    19 tools ·   8,522 bytes ·   ~2,100 tokens, plus a batch only when you open one
 ```
+
+That is a **98.3% cut** in tool-schema bytes, and on opencode it took the whole static prefix from **170,276 tokens to 31,493** — which is also 49,431 tokens *less* than the same config with three of its heaviest servers switched off.
 
 ## Install
 
@@ -198,9 +202,9 @@ Run `tcc report`:
 ```
 tool-call-compactor report
 
-Advertised index      : 18 tools, ~812 tokens
-Hidden behind groups  : 492 tools, ~136,477 tokens
-Reduction             : 99.4% of tool-schema tokens
+Advertised index      : 19 tools, ~2,131 tokens
+Hidden behind groups  : 518 tools, ~122,476 tokens
+Reduction             : 98.3% of tool-schema tokens
 
 Since 2026-09-11T02:14:07.221Z:
   group fetches       : 7 (~23,140 tokens pulled on demand)
