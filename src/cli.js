@@ -301,6 +301,81 @@ function cmdExpose(args) {
   out(`wrote ${configPath(dir)} — restart the harness (or its MCP server) to pick it up.`)
 }
 
+/**
+ * `tcc doctor` — check a config against the live upstreams before trusting it.
+ *
+ * The failure this exists for: an upstream that answers `tools/list` with a schema
+ * the MCP validator rejects is reported as **0 tools** by a plain scan, which reads
+ * exactly like "this server has no tools" rather than "this server is broken". A
+ * config can look fine and advertise nothing. Doctor snapshots every upstream and
+ * says, per server: did it answer, how many tools, and does the batch that claims it
+ * actually resolve to any of them.
+ */
+async function cmdDoctor(args) {
+  const dir = resolveConfigDir(args.config)
+  const cfg = loadConfig(dir)
+  const verbose = !args.quiet
+
+  if (verbose) out(`checking ${Object.keys(cfg.mcp || {}).length} upstream(s) in ${configPath(dir)}`)
+  const pool = buildPool(cfg, { log: (m) => { if (verbose) err(`  ${m}`) } })
+  const catalog = await snapshot(pool, {
+    log: (m) => { if (verbose) err(`  ! ${m}`) },
+    concurrency: Number(args.concurrency) || 6,
+  })
+
+  const servers = Object.entries(catalog.servers || {})
+  const broken = servers.filter(([, e]) => !e.ok || !(e.tools || []).length)
+  const groups = cfg.groups || {}
+  const index = toolIndex(catalog)
+
+  if (verbose) {
+    out("")
+    out("upstreams:")
+    for (const [name, entry] of servers) {
+      const n = (entry.tools || []).length
+      out(entry.ok && n
+        ? `  ok    ${name.padEnd(22)} ${String(n).padStart(4)} tools`
+        : `  BROKEN ${name.padEnd(22)} ${entry.ok ? "0 tools (schema rejected?)" : String(entry.error).slice(0, 90)}`)
+    }
+    out("")
+    out("batches:")
+    for (const [id, group] of Object.entries(groups)) {
+      const tools = index.size ? toolsInGroup(group, catalog, index) : []
+      const names = (group.tools || []).map((r) => String(r).split("::")[0])
+      const dead = names.filter((s) => {
+        const e = catalog.servers?.[s]
+        return !e || !e.ok || !(e.tools || []).length
+      })
+      const flag = tools.length ? "ok   " : "EMPTY"
+      out(`  ${flag} ${id.padEnd(22)} ${String(tools.length).padStart(4)} tools  ${group.title || titleFor(id)}`)
+      if (dead.length) out(`        points at broken upstream(s): ${[...new Set(dead)].join(", ")}`)
+    }
+  }
+
+  // Exit non-zero when something is wrong, so this can gate a setup script.
+  const problems = []
+  if (broken.length) problems.push(`${broken.length} upstream(s) advertise no tools: ${broken.map(([n]) => n).join(", ")}`)
+  const emptyBatches = Object.entries(groups).filter(([, g]) => {
+    const names = (g.tools || []).map((r) => String(r).split("::")[0])
+    const known = names.some((s) => catalog.servers?.[s]?.ok)
+    return !known && !(index.size ? toolsInGroup(g, catalog, index).length : 0)
+  })
+  if (emptyBatches.length) problems.push(`${emptyBatches.length} batch(es) resolve to nothing: ${emptyBatches.map(([id]) => id).join(", ")}`)
+
+  out("")
+  if (problems.length) {
+    out(`doctor: ${problems.length} problem(s)`)
+    for (const p of problems) out(`  - ${p}`)
+    const { tools: t, tokens } = totals(catalog)
+    out(`  (catalog: ${t} tools, ~${tokens} tokens)`)
+    process.exitCode = 1
+  } else {
+    const { tools: t, tokens } = totals(catalog)
+    out(`doctor: all ${servers.length} upstream(s) healthy — ${t} tools, ~${tokens} tokens of schema compacted behind ${Object.keys(groups).length} batch(es)`)
+  }
+  pool.closeAll()
+}
+
 function cmdReport(args) {
   const dir = resolveConfigDir(args.config)
   const cfg = loadConfig(dir)
@@ -520,6 +595,7 @@ const HELP = `tool-call-compactor — keep tool schemas out of the prompt until 
   tcc report [--config DIR] [--days N]                   what it saved, from real metrics
   tcc serve [--config DIR] [--workdir PATH]              run the MCP server (a harness runs this)
   tcc selftest                                           exercise the built-in tools
+  tcc doctor [--config DIR]                              check every upstream and batch, exit 1 if broken
   tcc harnesses                                          show detected harness configs
 
 Harnesses: ${Object.keys(HARNESSES).join(", ")}
@@ -551,6 +627,8 @@ export async function main(argv) {
       return cmdServe(args)
     case "selftest":
       return cmdSelftest(args)
+    case "doctor":
+      return cmdDoctor(args)
     case "harnesses":
       return cmdHarnesses(args)
     case "help":
