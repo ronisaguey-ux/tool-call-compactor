@@ -245,9 +245,16 @@ function cmdGroups(args) {
     .map(([id]) => id)
   out(`${Object.keys(groups).length} batches (persist ${policy.mode}${policy.budget ? `, budget ${policy.budget}` : ""})`)
   for (const [id, group] of Object.entries(groups)) {
-    const count = index.size ? toolsInGroup(group, cache, index).length : 0
+    const members = index.size ? toolsInGroup(group, cache, index) : []
+    const count = members.length
+    const tokens = members.reduce((n, t) => n + (t.tokens || 0), 0)
     const kind = group.expose ? `live (${id}__<tool>)` : `see_tools_${id}`
-    out(`  ${kind.padEnd(24)} ${String(count).padStart(4)} tools  ${(group.title || titleFor(id)).padEnd(18)} ${group.description}`)
+    // The token cost is what the agent is deciding about: opening this batch spends
+    // these tokens from the context budget. Without it the index says how many tools
+    // a batch holds but not what it costs to look, which is the only number a model
+    // weighing "should I open this?" can act on.
+    const cost = tokens ? `~${String(tokens).padStart(5)} tok` : "        ?"
+    out(`  ${kind.padEnd(24)} ${String(count).padStart(4)} tools  ${cost}  ${(group.title || titleFor(id)).padEnd(18)} ${group.description}`)
   }
   if (exposed.length) {
     out("")
