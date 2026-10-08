@@ -318,12 +318,80 @@ function cmdExpose(args) {
  * says, per server: did it answer, how many tools, and does the batch that claims it
  * actually resolve to any of them.
  */
+/** Find an executable on PATH the way a shell would, without spawning one. */
+function onPath(name) {
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""]
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue
+    for (const ext of exts) {
+      const full = path.join(dir, name + ext)
+      if (existsSync(full)) return full
+    }
+  }
+  return ""
+}
+
+/**
+ * Validate each upstream's command BEFORE trying to start it.
+ *
+ * A config whose command points at a file that does not exist, or still holds an unresolved
+ * placeholder, fails in a way that looks like a network or schema problem — the server simply
+ * advertises nothing and the batch comes back empty. Catching it here names the real cause.
+ * This is the `{env:KIT_DIR}` class of bug, and it cost real time before this check existed.
+ */
+export function preflightUpstreams(cfg) {
+  const problems = []
+  for (const [name, entry] of Object.entries(cfg.mcp || {})) {
+    if (!entry || typeof entry !== "object") { problems.push(`${name}: entry is not an object`); continue }
+    const raw = entry.command ?? entry.args ?? []
+    const argv = Array.isArray(raw) ? raw : [raw]
+    if (!argv.length || typeof argv[0] !== "string" || !argv[0].trim()) {
+      problems.push(`${name}: no command — the server cannot start`)
+      continue
+    }
+    const joined = argv.map((a) => String(a)).join(" ")
+    const placeholder = joined.match(/\{env:[^}]+\}|__KIT_DIR__|<[A-Z_]+>/)
+    if (placeholder) {
+      problems.push(`${name}: command still contains the placeholder ${placeholder[0]} — it is never resolved, so the server cannot start`)
+      continue
+    }
+    const bin = argv[0]
+    // A path-like first argument (or any argument that is clearly a file) must exist.
+    const looksLikePath = (s) => s.includes("/") || s.includes("\\")
+    const fileArgs = argv.filter((a) => typeof a === "string" && looksLikePath(a))
+    const missingFile = fileArgs.find((a) => !existsSync(a))
+    if (missingFile) {
+      problems.push(`${name}: the file ${missingFile} does not exist`)
+      continue
+    }
+    if (!looksLikePath(bin) && !onPath(bin)) {
+      problems.push(`${name}: '${bin}' is not on PATH`)
+      continue
+    }
+    const cwd = entry.cwd || entry.workdir
+    if (typeof cwd === "string" && cwd && !existsSync(cwd)) {
+      problems.push(`${name}: cwd ${cwd} does not exist`)
+    }
+  }
+  return problems
+}
+
 async function cmdDoctor(args) {
   const dir = resolveConfigDir(args.config)
   const cfg = loadConfig(dir)
   const verbose = !args.quiet
 
   if (verbose) out(`checking ${Object.keys(cfg.mcp || {}).length} upstream(s) in ${configPath(dir)}`)
+
+  // Static checks first: a config that cannot even start its servers does not need a snapshot
+  // to explain why.
+  const configProblems = preflightUpstreams(cfg)
+  if (configProblems.length) {
+    out("")
+    out("config:")
+    for (const p of configProblems) out(`  CONFIG ${p}`)
+  }
+
   const pool = buildPool(cfg, { log: (m) => { if (verbose) err(`  ${m}`) } })
   const catalog = await snapshot(pool, {
     log: (m) => { if (verbose) err(`  ! ${m}`) },
@@ -360,7 +428,7 @@ async function cmdDoctor(args) {
   }
 
   // Exit non-zero when something is wrong, so this can gate a setup script.
-  const problems = []
+  const problems = [...configProblems]
   if (broken.length) problems.push(`${broken.length} upstream(s) advertise no tools: ${broken.map(([n]) => n).join(", ")}`)
   const emptyBatches = Object.entries(groups).filter(([, g]) => {
     const names = (g.tools || []).map((r) => String(r).split("::")[0])
