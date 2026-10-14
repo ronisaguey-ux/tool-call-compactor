@@ -16,7 +16,7 @@
     "report": "node bin/tcc.js report"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0"
+    "@modelcontextprotocol/sdk": "^1.31.0"
   },
   "license": "MIT"
 }
