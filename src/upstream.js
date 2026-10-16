@@ -18,7 +18,16 @@ export function normalizeSpec(spec) {
   if (spec.url || spec.type === "remote" || spec.transport === "http" || spec.transport === "sse") {
     return { kind: "http", url: spec.url, headers: spec.headers || {} }
   }
-  const command = Array.isArray(spec.command) ? spec.command : [spec.command, ...(spec.args || [])]
+  let command = []
+  if (Array.isArray(spec.command)) {
+    command = spec.command
+  } else if (typeof spec.command === "string") {
+    command = (spec.args && Array.isArray(spec.args) && spec.args.length > 0)
+      ? [spec.command, ...spec.args]
+      : spec.command.trim().split(/\s+/)
+  } else if (Array.isArray(spec.args)) {
+    command = spec.args
+  }
   if (!command[0]) throw new Error("upstream spec has neither url nor command")
   const env = spec.environment || spec.env || {}
   return {
@@ -74,7 +83,7 @@ export class Upstream {
               stderr: "ignore",
             })
       const client = new Client({ name: "tool-call-compactor", version: "0.1.0" }, { capabilities: {} })
-      await client.connect(transport)
+      await withTimeout(client.connect(transport), this.timeoutMs, `${this.name} connect`)
       this.client = client
       this.stats.spawns += 1
       this.log(`upstream connected: ${this.name}`)
@@ -125,7 +134,9 @@ export class Upstream {
       } catch (err) {
         lastErr = err
         this.stats.errors += 1
+        const old = this.client
         this.client = null // force a fresh connection on the next attempt
+        if (old) Promise.resolve(old.close()).catch(() => {})
         if (attempt < this.retries) await sleep(150 * 2 ** attempt + Math.random() * 100)
       }
     }

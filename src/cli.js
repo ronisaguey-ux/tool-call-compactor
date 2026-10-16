@@ -343,6 +343,19 @@ export function preflightUpstreams(cfg) {
   const problems = []
   for (const [name, entry] of Object.entries(cfg.mcp || {})) {
     if (!entry || typeof entry !== "object") { problems.push(`${name}: entry is not an object`); continue }
+    if (entry.enabled === false || entry.disabled === true) continue
+    if (entry.url || entry.type === "remote" || entry.transport === "http" || entry.transport === "sse") {
+      if (!entry.url || typeof entry.url !== "string") {
+        problems.push(`${name}: remote server has no valid url`)
+      } else {
+        try {
+          new URL(entry.url)
+        } catch {
+          problems.push(`${name}: invalid url '${entry.url}'`)
+        }
+      }
+      continue
+    }
     const raw = entry.command ?? entry.args ?? []
     const argv = Array.isArray(raw) ? raw : [raw]
     if (!argv.length || typeof argv[0] !== "string" || !argv[0].trim()) {
@@ -358,7 +371,12 @@ export function preflightUpstreams(cfg) {
     const bin = argv[0]
     // A path-like first argument (or any argument that is clearly a file) must exist.
     const looksLikePath = (s) => s.includes("/") || s.includes("\\")
-    const fileArgs = argv.filter((a) => typeof a === "string" && looksLikePath(a))
+    const isPackageRunner = bin === "npx" || bin === "bunx" || bin === "pnpx" || bin === "yarn"
+    const fileArgs = argv.filter((a) => {
+      if (typeof a !== "string" || !looksLikePath(a)) return false
+      if (isPackageRunner && (a.startsWith("@") || (!a.startsWith(".") && !a.startsWith("/")))) return false
+      return true
+    })
     const missingFile = fileArgs.find((a) => !existsSync(a))
     if (missingFile) {
       problems.push(`${name}: the file ${missingFile} does not exist`)
