@@ -638,3 +638,127 @@ async function cmdSelftest(): Promise<void> {
 
   r = await up.callTool("edit", { filePath: "src/hello.txt", oldString: "beta", newString: "BETA" })
   check("edit replaces text", fs.readFileSync(path.join(dir, "src/hello.txt"), "utf8").includes("BETA"), text(r))
+
+  r = await up.callTool("edit", { filePath: "src/hello.txt", oldString: "zzz", newString: "x" })
+  check("edit fails when oldString is absent", r.isError === true)
+
+  r = await up.callTool("glob", { pattern: "**/*.txt" })
+  check("glob finds the file", text(r).includes("hello.txt"), text(r))
+
+  r = await up.callTool("grep", { pattern: "BETA", path: "src" })
+  check("grep finds the line", /hello\.txt:2/.test(text(r)), text(r))
+
+  r = await up.callTool("bash", { command: "echo $((6*7))" })
+  check("bash runs and returns stdout", text(r).includes("42"), text(r))
+
+  r = await up.callTool("bash", { command: "exit 3" })
+  check("bash reports a failing exit code", r.isError === true && /exit 3/.test(text(r)))
+
+  const http = await import("node:http")
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/html" })
+    res.end("<html><body><h1>Hello</h1><script>bad()</script><p>fetch works</p></body></html>")
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const { port } = server.address() as import("node:net").AddressInfo
+  r = await up.callTool("webfetch", { url: `http://127.0.0.1:${port}/page` })
+  check("webfetch fetches and strips HTML", /fetch works/.test(text(r)) && !/<script>/.test(text(r)), text(r).split("\n")[0])
+  server.close()
+
+  fs.rmSync(dir, { recursive: true, force: true })
+  out("")
+  out(fails.length ? `${fails.length} failing: ${fails.join(", ")}` : `all ${Object.keys(BUILTINS).length} built-ins work`)
+  if (fails.length) process.exitCode = 1
+}
+
+function cmdSnippet(args: CliArgs): void {
+  const dir = resolveConfigDir(str(args.config))
+  const cliPath = path.resolve(__dirname, "../bin/tcc.js")
+  const harness = str(args.harness) || "opencode"
+  const spec = HARNESSES[harness]
+  if (!spec) {
+    out(`unknown harness "${harness}". Known: ${Object.keys(HARNESSES).join(", ")}`)
+    process.exitCode = 1
+    return
+  }
+  out(`# ${spec.label} — ${spec.paths[0]}`)
+  out("")
+  if (spec.key === "mcp") {
+    out(JSON.stringify({ mcp: { compactor: { type: "local", command: ["node", cliPath, "serve", "--config", dir], enabled: true } } }, null, 2))
+  } else if (spec.format === "toml") {
+    out("[mcp_servers.compactor]")
+    out('command = "node"')
+    out(`args = ["${cliPath}", "serve", "--config", "${dir}"]`)
+  } else {
+    out(JSON.stringify({ [spec.key]: { compactor: { command: "node", args: [cliPath, "serve", "--config", dir] } } }, null, 2))
+  }
+}
+
+function cmdHarnesses(): void {
+  const detected = detectHarnesses()
+  for (const row of detected.report) {
+    out(`${row.label.padEnd(16)} ${row.found ? "found" : "absent"}  ${String(row.count).padStart(3)} servers  ${row.path}`)
+  }
+}
+
+const HELP = `tool-call-compactor — keep tool schemas out of the prompt until they are needed
+
+  tcc init [--harness a,b] [--builtins] [--include-disabled] [--config DIR]
+                                                         detect servers, snapshot, write batches
+  tcc bootstrap [--harness NAME] [--builtins]            init + install, in one step
+  tcc install --harness NAME [--remove a,b] [--config DIR]
+  tcc snippet --harness NAME                             print the config fragment instead
+  tcc scan [--config DIR]                                re-snapshot and show the grouping
+  tcc batch [--config DIR]                               rebuild batches, keeping your titles
+  tcc groups [--config DIR]                              print the advertised index
+  tcc expose <batch> [--off]                             keep a batch's tools always advertised
+  tcc report [--config DIR] [--days N]                   what it saved, from real metrics
+  tcc serve [--config DIR] [--workdir PATH]              run the MCP server (a harness runs this)
+  tcc selftest                                           exercise the built-in tools
+  tcc doctor [--config DIR]                              check every upstream and batch, exit 1 if broken
+  tcc harnesses                                          show detected harness configs
+
+Harnesses: ${Object.keys(HARNESSES).join(", ")}
+`
+
+export async function main(argv: string[]): Promise<void> {
+  const args = parseArgs(argv)
+  const command = args._[0] || "help"
+  switch (command) {
+    case "init":
+      return cmdInit(args)
+    case "bootstrap":
+      return cmdBootstrap(args)
+    case "install":
+      return cmdInstall(args)
+    case "snippet":
+      return cmdSnippet(args)
+    case "scan":
+      return cmdScan(args)
+    case "batch":
+      return cmdBatch(args)
+    case "groups":
+      return cmdGroups(args)
+    case "expose":
+      return cmdExpose(args)
+    case "report":
+      return cmdReport(args)
+    case "serve":
+      return cmdServe(args)
+    case "selftest":
+      return cmdSelftest()
+    case "doctor":
+      return cmdDoctor(args)
+    case "harnesses":
+      return cmdHarnesses()
+    case "help":
+    case "--help":
+    case "-h":
+      out(HELP)
+      return
+    default:
+      err(`unknown command: ${command}`)
+      out(HELP)
+      process.exitCode = 1
+  }
+}
