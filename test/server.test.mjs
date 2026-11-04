@@ -8,11 +8,11 @@ import os from "node:os"
 import path from "node:path"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { Compactor } from "../src/server.js"
-import { defaultConfig } from "../src/config.js"
-import { Metrics } from "../src/metrics.js"
-import { estimateTokens } from "../src/catalog.js"
-import { autoGroups } from "../src/groups.js"
+import { Compactor } from "../dist/server.js"
+import { defaultConfig } from "../dist/config.js"
+import { Metrics } from "../dist/metrics.js"
+import { estimateTokens } from "../dist/catalog.js"
+import { autoGroups } from "../dist/groups.js"
 
 const big = (n) => "x".repeat(n)
 

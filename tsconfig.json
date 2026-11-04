@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2022",
+    "moduleResolution": "node",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "sourceMap": false,
+    "declaration": false,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@modelcontextprotocol/sdk/server/index.js": ["./node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.d.ts"],
+      "@modelcontextprotocol/sdk/server/stdio.js": ["./node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.d.ts"],
+      "@modelcontextprotocol/sdk/client/index.js": ["./node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.d.ts"],
+      "@modelcontextprotocol/sdk/client/stdio.js": ["./node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.d.ts"],
+      "@modelcontextprotocol/sdk/client/streamableHttp.js": ["./node_modules/@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.d.ts"],
+      "@modelcontextprotocol/sdk/inMemory.js": ["./node_modules/@modelcontextprotocol/sdk/dist/esm/inMemory.d.ts"],
+      "@modelcontextprotocol/sdk/types.js": ["./node_modules/@modelcontextprotocol/sdk/dist/esm/types.d.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}
