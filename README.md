@@ -27,8 +27,16 @@ That is a **98.3% cut** in tool-schema bytes, and on opencode it took the whole 
 ```bash
 git clone https://github.com/ronisaguey-ux/tool-call-compactor.git
 cd tool-call-compactor
-npm install
+npm install         # also compiles src/*.ts to dist/ (npm prepare)
 npm link            # optional: puts `tcc` on your PATH
+```
+
+The source is TypeScript in `src/`; `bin/tcc.js` is a thin shim that runs `dist/cli.js`. Rebuild after editing:
+
+```bash
+npm run build       # tsc -p tsconfig.json  → dist/
+npm run typecheck   # tsc --noEmit
+npm test            # builds, then runs test/*.test.mjs
 ```
 
 Then, in one step — detect every MCP server your harnesses already have configured, snapshot their tools, write the batches, and install itself in front of them:
