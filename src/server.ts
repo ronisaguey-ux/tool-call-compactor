@@ -638,3 +638,323 @@ export class Compactor {
     }
     const live = [...this.registered]
     const hidden = [...this.index.keys()].filter((key) => !this.exposedByKey.has(key)).length
+    const lines: Array<string | null> = [
+      `${ids.length} batches, ${hidden} tools hidden behind them. Each batch lists its tools.`,
+      "",
+      ...ids.flatMap((id) => [this.groupLine(id), this.namesLine(id)]),
+      "",
+      "Fetch one batch's schemas with see_tools_<group>, then run a tool with call_tool. If the index does",
+      "not obviously cover what you need, search_tools {query} scans all of it before you conclude anything.",
+      live.length ? `Live batches (tools already in your tool list): ${live.join(", ")}.` : null,
+      this.policy.mode === "agent"
+        ? "A fetched batch stays fetch-only until you call persist_group {group, persist: true}."
+        : this.policy.mode === "off"
+          ? "persist is off: fetched schemas are never added to your tool list; use call_tool."
+          : `Fetched batches stay live for the session${this.policy.budget ? ` while under ${this.policy.budget} tokens` : ""}.`,
+    ]
+    return this.text(lines.filter((line) => line !== null).join("\n"))
+  }
+
+  scoreTool(tool: IndexedTool, groupId: string, query: string): number {
+    const name = tool.name.toLowerCase()
+    const desc = (tool.description || "").toLowerCase()
+    const server = tool.server.toLowerCase()
+    let score = 0
+    if (name === query) score += 200
+    else if (name.includes(query)) score += 60
+    if (groupId.includes(query)) score += 25
+    for (const word of query.split(/[\s_]+/).filter((w) => w.length > 1)) {
+      if (name.includes(word)) score += 14
+      if (desc.includes(word)) score += 5
+      if (server.includes(word)) score += 7
+      if (groupId.includes(word)) score += 4
+    }
+    return score
+  }
+
+  tSearchTools({ query, limit = 20 }: SearchArgs = {}): McpTextReply {
+    const q = String(query || "").trim().toLowerCase()
+    if (!q) throw new Error("search_tools needs a query")
+    const groupOf = new Map<string, string>()
+    for (const [id, group] of Object.entries(this.groups)) {
+      for (const tool of toolsInGroup(group, this.catalog, this.index)) groupOf.set(`${tool.server}::${tool.name}`, id)
+      for (const server of group.servers || []) groupOf.set(`server::${server}`, id)
+    }
+    const hits: Array<{ tool: IndexedTool; groupId: string; score: number }> = []
+    for (const [key, tool] of this.index) {
+      const groupId = groupOf.get(key) || groupOf.get(`server::${tool.server}`) || groupIdForServer(tool.server)
+      const score = this.scoreTool(tool, groupId, q)
+      if (score > 0) hits.push({ tool, groupId, score })
+    }
+    hits.sort((a, b) => b.score - a.score)
+    const top = hits.slice(0, Math.max(1, Math.min(Number(limit) || 20, 100)))
+    this.metrics?.record("search", { query: q, results: top.length, scanned: this.index.size })
+    if (!top.length) {
+      return this.text(`No tool matched "${String(query)}". ${this.index.size} tools are indexed; try list_groups.`)
+    }
+    const lines = top.map(({ tool, groupId }) => {
+      const summary = clampWords(tool.description, 18)
+      return `${tool.server}::${tool.name}  [${groupId}]${summary ? ` — ${summary}` : ""}`
+    })
+    return this.text(
+      [`${top.length} of ${hits.length} matches for "${String(query)}":`, "", ...lines, "", "Fetch a group with see_tool_<group>, then call_tool."].join(
+        "\n",
+      ),
+    )
+  }
+
+  async tFetchGroup(rawId: unknown, { tool, names_only, persist }: FetchArgs = {}): Promise<McpTextReply> {
+    const found = findGroup(this.groups, rawId)
+    if (!found) {
+      const ids = Object.keys(this.groups)
+      return this.text(`Unknown group "${String(rawId)}". Available: ${ids.join(", ") || "(none)"}`)
+    }
+    const { id, group } = found
+    const wasLive = this.registered.has(id)
+    const tools = await this.toolsForGroup(id, group)
+    if (!tools.length) {
+      const servers = (group.servers || []).join(", ") || "none"
+      return this.text(
+        `Group "${id}" has no readable tools. Servers: ${servers}. ` +
+          `Run \`tcc scan\` to refresh the catalog, or check those servers are reachable.`,
+      )
+    }
+    const totalTokens = tools.reduce((n, t) => n + (t.tokens || estimateTokens(t)), 0)
+    this.metrics?.record("fetch", {
+      group: id,
+      tools: tools.length,
+      bytes: JSON.stringify(tools).length,
+      tokens: totalTokens,
+      namesOnly: !!names_only,
+      persisted: wasLive || this.registered.has(id),
+    })
+    const exposed: ExposeOutcome = names_only ? { exposed: 0, reason: "names-only" } : await this.maybeExpose(id, tools, { persist })
+    const liveNow = this.registered.has(id)
+    const header: Array<string | null | undefined> = [
+      `# ${group.title || titleFor(id)} [${id}] — ${tools.length} tools, ~${totalTokens} tokens of schema`,
+      group.description,
+      group.servers?.length ? `Servers: ${group.servers.join(", ")}` : null,
+      liveNow
+        ? `These tools are in your tool list for the rest of the session — call them as ${id}__<tool>.`
+        : exposed.reason === "agent-decides"
+          ? "Not added to your tool list. Call persist_group {group, persist: true} to keep them live, or use call_tool."
+          : exposed.reason === "over-budget"
+            ? `Not added to your tool list: ~${exposed.cost} tokens is over the ${exposed.budget}-token persist budget. Use call_tool.`
+            : exposed.reason === "persist-off"
+              ? "persist is off, so these schemas stay out of your tool list. Execute with call_tool."
+              : "Execute with call_tool {server, tool, arguments}.",
+      "",
+    ]
+
+    if (tool) {
+      const wanted = String(tool).toLowerCase()
+      const match = tools.find((t) => t.name.toLowerCase() === wanted) || tools.find((t) => t.name.toLowerCase().includes(wanted))
+      if (!match) {
+        return this.text(`${header.filter((line) => line !== null).join("\n")}\nNo tool named "${String(tool)}" in ${id}. Available: ${tools.map((t) => t.name).join(", ")}`)
+      }
+      return this.text(
+        [
+          `# ${match.name} (${match.server})`,
+          match.description || "",
+          JSON.stringify(clampSchema(match.inputSchema), null, 1),
+        ].join("\n"),
+      )
+    }
+
+    // Fetched twice: the schemas are already in the tool list, so repeating them
+    // here would pay for the same tokens a second time.
+    if (wasLive && liveNow && !names_only) {
+      return this.text(
+        [
+          ...header.filter((line) => line !== null),
+          `${tools.length} tools, already live under ${id}__:`,
+          tools.map((t) => this.exposedByKey.get(`${t.server}::${t.name}`) || t.name).join(", "),
+          "",
+          `Call them directly. {tool: "<name>"} returns one schema, {names_only: true} returns one-line summaries.`,
+        ].join("\n"),
+      )
+    }
+
+    const body = tools.map((t) => {
+      const summary = names_only ? clampWords(t.description, 15) : t.description
+      const schema = names_only ? "" : `\n${JSON.stringify(clampSchema(t.inputSchema))}`
+      return `## ${t.name} (${t.server})\n${summary || "(no description)"}${schema}`
+    })
+    return this.text([...header.filter((line) => line !== null), ...body].join("\n"))
+  }
+
+  async toolsForGroup(id: string, group: GroupConfig): Promise<IndexedTool[]> {
+    const known = toolsInGroup(group, this.catalog, this.index)
+    if (known.length) return known
+    // No snapshot covers this group yet — ask the servers directly.
+    const out: IndexedTool[] = []
+    for (const server of group.servers || []) {
+      if (!this.pool.has(server)) continue
+      try {
+        const live = await this.pool.get(server).listTools()
+        for (const t of live) {
+          out.push({
+            server,
+            name: t.name,
+            description: t.description || "",
+            inputSchema: t.inputSchema || { type: "object", properties: {} },
+            tokens: estimateTokens(t),
+          })
+        }
+      } catch (err) {
+        this.log(`live tool listing failed for ${server}: ${(err as Error).message}`)
+      }
+    }
+    return out
+  }
+
+  /** The agent's own switch over the persist policy: keep a batch live, drop
+   *  it, or ask what state it is in. `permanent` writes the choice into
+   *  `expose`, which is the config-level pass-through and outranks the session
+   *  policy — a batch marked `expose: true` is live from the first request of
+   *  every session, whatever `options.persist` says. */
+  async tPersistGroup({ group, persist, permanent }: PersistArgs = {}): Promise<McpTextReply> {
+    const found = findGroup(this.groups, group)
+    if (!found) {
+      return this.text(`Unknown batch "${String(group)}". Available: ${Object.keys(this.groups).join(", ") || "(none)"}`)
+    }
+    const { id, group: g } = found
+    const title = g.title || titleFor(id)
+    const mode = `persist=${this.policy.mode}${this.policy.budget ? ` (budget ${this.policy.budget} tokens)` : ""}`
+    const state = (): string =>
+      this.registered.has(id) ? (this.pinned.has(id) ? "pinned live for this session" : "live") : "fetch-only"
+
+    if (persist === undefined && permanent === undefined) {
+      return this.text(`"${id}" (${title}): ${state()}, ${mode}.`)
+    }
+
+    const wants = persist === undefined ? true : !!persist
+    const notes: string[] = []
+    if (permanent === true) {
+      this.groups[id] = { ...this.groups[id] }
+      if (wants) this.groups[id].expose = true
+      else delete this.groups[id].expose
+      this.config.groups = this.config.groups || {}
+      const entry: GroupConfig = { ...(this.config.groups[id] || {}), ...this.groups[id] }
+      if (!wants) delete entry.expose
+      this.config.groups[id] = entry
+      try {
+        notes.push(`saved to ${saveConfig(this.config)}`)
+      } catch (err) {
+        this.log(`could not persist batch: ${(err as Error).message}`)
+        notes.push("could not save the config")
+      }
+    }
+
+    if (!wants) {
+      const { removed } = await this.unregisterGroup(id)
+      notes.push(removed ? `dropped ${removed} tools from the tool list` : "was not live")
+      return this.text(`"${id}" (${title}): fetch-only. ${notes.join("; ")}.`)
+    }
+
+    if (this.policy.mode === "off" && permanent !== true) {
+      return this.text(
+        `"${id}" is fetch-only: ${mode}, so the server will not add tools on request. ` +
+          `Set options.persist to "agent" (or "auto") in tcc.config.json, or call this with permanent: true to mark the batch expose:true.`,
+      )
+    }
+
+    const tools = await this.toolsForGroup(id, g)
+    if (!tools.length) {
+      return this.text(`"${id}" has no readable tools — run \`tcc scan\` to snapshot its servers.`)
+    }
+    let result: ExposeOutcome
+    if (permanent === true) {
+      // `expose: true` is a statement about the config, not about this session,
+      // so it outranks the persist policy rather than being gated by it.
+      const added = this.registered.has(id) ? 0 : this.registerGroup(id, tools)
+      if (added) await this.notifyToolList()
+      result = { exposed: added, reason: added ? "registered" : "already" }
+    } else {
+      result = await this.maybeExpose(id, tools, { persist: true })
+    }
+    const n = result.exposed
+    if (n) notes.unshift(`kept ${n} tool${n === 1 ? "" : "s"} live as ${id}__<tool>`)
+    else notes.unshift(result.reason === "already" ? "already live" : `not registered (${result.reason})`)
+    this.metrics?.record("persist", { group: id, tools: tools.length, permanent: permanent === true, mode: this.policy.mode })
+    return this.text(
+      `"${id}" (${title}): ${state()}. ${notes.join("; ")}.` +
+        (result.exposed ? " A harness that does not refresh its tool list mid-session will see them on its next restart." : ""),
+    )
+  }
+
+  async invokeDynamic(entry: DynamicEntry, args: Record<string, unknown>): Promise<McpTextReply> {
+    return this.execute(entry.server, entry.tool, args)
+  }
+
+  async tCallTool({ server, tool, arguments: toolArgs, compress }: CallArgs = {}): Promise<McpTextReply> {
+    if (!tool) throw new Error("call_tool needs a tool name")
+    let srv = server as string | undefined
+    let name = String(tool)
+    if (!srv && name.includes("::")) {
+      const [a, b] = name.split("::")
+      srv = a
+      name = b
+    }
+    if (!srv) {
+      const owners = [...this.index.values()].filter((t) => t.name === name).map((t) => t.server)
+      if (owners.length === 1) srv = owners[0]
+      else if (owners.length > 1) throw new Error(`"${name}" exists on ${owners.join(", ")} — pass server explicitly`)
+      else throw new Error(`unknown tool "${name}". Use search_tools to find it.`)
+    }
+    return this.execute(srv, name, (toolArgs as Record<string, unknown>) || {}, compress)
+  }
+
+  async execute(server: string, tool: string, args: Record<string, unknown>, compress: unknown = true): Promise<McpTextReply> {
+    if (!this.pool.has(server)) throw new Error(`unknown server "${server}". Known: ${this.pool.names().join(", ")}`)
+    const started = Date.now()
+    const result = await this.pool.get(server).callTool(tool, args)
+    const before = textBytes(result)
+    const useCompress = this.options.compress !== false && compress !== false
+    const { result: out, compressed } = useCompress
+      ? compressResult(result, { maxText: this.options.maxText })
+      : { result, compressed: false }
+    const reply = out as McpCallToolResult
+    this.metrics?.record("call", {
+      server,
+      tool,
+      bytes: before,
+      outBytes: textBytes(reply),
+      compressed,
+      isError: !!reply.isError,
+      ms: Date.now() - started,
+    })
+    return reply as unknown as McpTextReply
+  }
+
+  async tDescribeGroup({ group, title, description }: DescribeArgs = {}): Promise<McpTextReply> {
+    const found = findGroup(this.groups, group)
+    if (!found) return this.text(`Unknown batch "${String(group)}". Available: ${Object.keys(this.groups).join(", ")}`)
+    if (!title && !description) throw new Error("describe_group needs a title or a description")
+    const notes: string[] = []
+    let id = found.id
+
+    if (title) {
+      const clean = clampWords(String(title), 8)
+      this.groups[id].title = clean
+      const renamed = slug(clean)
+      if (renamed && renamed !== id) {
+        if (this.groups[renamed]) {
+          notes.push(`title set, but "${renamed}" already exists so see_tools_${id} keeps its name`)
+        } else {
+          const wasLive = this.registered.has(id)
+          const tools = wasLive ? toolsInGroup(this.groups[id], this.catalog, this.index) : []
+          this.groups[renamed] = this.groups[id]
+          delete this.groups[id]
+          await this.unregisterGroup(id) // the exposed names carry the old id
+          if (wasLive) this.registerGroup(renamed, tools)
+          this.config.groups = this.config.groups || {}
+          delete this.config.groups[id]
+          notes.push(`renamed see_tools_${id} → see_tools_${renamed}`)
+          id = renamed
+        }
+      }
+    }
+
+    if (description) {
+      // Deliberately not truncated: whoever is writing this knows what the batch
