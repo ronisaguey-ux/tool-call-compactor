@@ -3,7 +3,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { persistPolicy, defaultConfig, LEGACY_DYNAMIC_BUDGET } from "../src/config.js"
+import { persistPolicy, defaultConfig, LEGACY_DYNAMIC_BUDGET } from "../dist/config.js"
 
 test("a config that says nothing gets the auto policy with no budget", () => {
   assert.deepEqual(persistPolicy({}), { mode: "auto", budget: 0, source: "default" })

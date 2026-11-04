@@ -16,7 +16,7 @@ import {
   toolIndex,
   wordCount,
   WORDS_RECOMMENDED,
-} from "../src/groups.js"
+} from "../dist/groups.js"
 
 const catalog = {
   servers: {
