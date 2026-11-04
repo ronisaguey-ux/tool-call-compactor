@@ -318,3 +318,323 @@ function cmdExpose(args: CliArgs): void {
   }
   const on = args.off ? false : true
   if (on) groups[found.id] = { ...found.group, expose: true }
+  else {
+    const copy: GroupConfig = { ...found.group }
+    delete copy.expose
+    groups[found.id] = copy
+  }
+  cfg.groups = groups
+  const cache = readCache(cfg.cachePath || defaultCachePath())
+  const count = cache ? toolsInGroup(groups[found.id], cache, toolIndex(cache)).length : 0
+  saveConfig(cfg, { backup: true })
+  out(
+    on
+      ? `"${found.id}" is now pass-through: its ${count} tools are advertised as ${found.id}__<tool> in every session, from the first request.`
+      : `"${found.id}" is compacted again: the harness will see see_tools_${found.id}.`,
+  )
+  out(`wrote ${configPath(dir)} — restart the harness (or its MCP server) to pick it up.`)
+}
+
+/**
+ * `tcc doctor` — check a config against the live upstreams before trusting it.
+ *
+ * The failure this exists for: an upstream that answers `tools/list` with a schema
+ * the MCP validator rejects is reported as **0 tools** by a plain scan, which reads
+ * exactly like "this server has no tools" rather than "this server is broken". A
+ * config can look fine and advertise nothing. Doctor snapshots every upstream and
+ * says, per server: did it answer, how many tools, and does the batch that claims it
+ * actually resolve to any of them.
+ */
+/** Find an executable on PATH the way a shell would, without spawning one. */
+function onPath(name: string): string {
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""]
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue
+    for (const ext of exts) {
+      const full = path.join(dir, name + ext)
+      if (existsSync(full)) return full
+    }
+  }
+  return ""
+}
+
+/**
+ * Validate each upstream's command BEFORE trying to start it.
+ *
+ * A config whose command points at a file that does not exist, or still holds an unresolved
+ * placeholder, fails in a way that looks like a network or schema problem — the server simply
+ * advertises nothing and the batch comes back empty. Catching it here names the real cause.
+ * This is the `{env:KIT_DIR}` class of bug, and it cost real time before this check existed.
+ */
+export function preflightUpstreams(cfg: { mcp?: Record<string, McpServerConfig> }): string[] {
+  const problems: string[] = []
+  for (const [name, entry] of Object.entries(cfg.mcp || {})) {
+    if (!entry || typeof entry !== "object") { problems.push(`${name}: entry is not an object`); continue }
+    if (entry.enabled === false || entry.disabled === true) continue
+    if (entry.url || entry.type === "remote" || entry.transport === "http" || entry.transport === "sse") {
+      if (!entry.url || typeof entry.url !== "string") {
+        problems.push(`${name}: remote server has no valid url`)
+      } else {
+        try {
+          new URL(entry.url)
+        } catch {
+          problems.push(`${name}: invalid url '${entry.url}'`)
+        }
+      }
+      continue
+    }
+    const raw = entry.command ?? entry.args ?? []
+    const argv: unknown[] = Array.isArray(raw) ? raw : [raw]
+    if (!argv.length || typeof argv[0] !== "string" || !argv[0].trim()) {
+      problems.push(`${name}: no command — the server cannot start`)
+      continue
+    }
+    const joined = argv.map((a) => String(a)).join(" ")
+    const placeholder = joined.match(/\{env:[^}]+\}|__KIT_DIR__|<[A-Z_]+>/)
+    if (placeholder) {
+      problems.push(`${name}: command still contains the placeholder ${placeholder[0]} — it is never resolved, so the server cannot start`)
+      continue
+    }
+    const bin = argv[0] as string
+    // A path-like first argument (or any argument that is clearly a file) must exist.
+    const looksLikePath = (s: string): boolean => s.includes("/") || s.includes("\\")
+    const isPackageRunner = bin === "npx" || bin === "bunx" || bin === "pnpx" || bin === "yarn"
+    const fileArgs = argv.filter((a): a is string => {
+      if (typeof a !== "string" || !looksLikePath(a)) return false
+      if (isPackageRunner && (a.startsWith("@") || (!a.startsWith(".") && !a.startsWith("/")))) return false
+      return true
+    })
+    const missingFile = fileArgs.find((a) => !existsSync(a))
+    if (missingFile) {
+      problems.push(`${name}: the file ${missingFile} does not exist`)
+      continue
+    }
+    if (!looksLikePath(bin) && !onPath(bin)) {
+      problems.push(`${name}: '${bin}' is not on PATH`)
+      continue
+    }
+    const cwd = entry.cwd || entry.workdir
+    if (typeof cwd === "string" && cwd && !existsSync(cwd)) {
+      problems.push(`${name}: cwd ${cwd} does not exist`)
+    }
+  }
+  return problems
+}
+
+async function cmdDoctor(args: CliArgs): Promise<void> {
+  const dir = resolveConfigDir(str(args.config))
+  const cfg = loadConfig(dir)
+  const verbose = !args.quiet
+
+  if (verbose) out(`checking ${Object.keys(cfg.mcp || {}).length} upstream(s) in ${configPath(dir)}`)
+
+  // Static checks first: a config that cannot even start its servers does not need a snapshot
+  // to explain why.
+  const configProblems = preflightUpstreams(cfg)
+  if (configProblems.length) {
+    out("")
+    out("config:")
+    for (const p of configProblems) out(`  CONFIG ${p}`)
+  }
+
+  const pool = buildPool(cfg, { log: (m) => { if (verbose) err(`  ${m}`) } })
+  const catalog = await snapshot(pool, {
+    log: (m) => { if (verbose) err(`  ! ${m}`) },
+    concurrency: Number(args.concurrency) || 6,
+  })
+
+  const servers = Object.entries(catalog.servers || {})
+  const broken = servers.filter(([, e]) => !e.ok || !(e.tools || []).length)
+  const groups = cfg.groups || {}
+  const index = toolIndex(catalog)
+
+  if (verbose) {
+    out("")
+    out("upstreams:")
+    for (const [name, entry] of servers) {
+      const n = (entry.tools || []).length
+      out(entry.ok && n
+        ? `  ok    ${name.padEnd(22)} ${String(n).padStart(4)} tools`
+        : `  BROKEN ${name.padEnd(22)} ${entry.ok ? "0 tools (schema rejected?)" : String(entry.error).slice(0, 90)}`)
+    }
+    out("")
+    out("batches:")
+    for (const [id, group] of Object.entries(groups)) {
+      const tools = index.size ? toolsInGroup(group, catalog, index) : []
+      const names = (group.tools || []).map((r) => String(r).split("::")[0])
+      const dead = names.filter((s) => {
+        const e = catalog.servers?.[s]
+        return !e || !e.ok || !(e.tools || []).length
+      })
+      const flag = tools.length ? "ok   " : "EMPTY"
+      out(`  ${flag} ${id.padEnd(22)} ${String(tools.length).padStart(4)} tools  ${group.title || titleFor(id)}`)
+      if (dead.length) out(`        points at broken upstream(s): ${[...new Set(dead)].join(", ")}`)
+    }
+  }
+
+  // Exit non-zero when something is wrong, so this can gate a setup script.
+  const problems = [...configProblems]
+  if (broken.length) problems.push(`${broken.length} upstream(s) advertise no tools: ${broken.map(([n]) => n).join(", ")}`)
+  const emptyBatches = Object.entries(groups).filter(([, g]) => {
+    const names = (g.tools || []).map((r) => String(r).split("::")[0])
+    const known = names.some((s) => catalog.servers?.[s]?.ok)
+    return !known && !(index.size ? toolsInGroup(g, catalog, index).length : 0)
+  })
+  if (emptyBatches.length) problems.push(`${emptyBatches.length} batch(es) resolve to nothing: ${emptyBatches.map(([id]) => id).join(", ")}`)
+
+  out("")
+  if (problems.length) {
+    out(`doctor: ${problems.length} problem(s)`)
+    for (const p of problems) out(`  - ${p}`)
+    const { tools: t, tokens } = totals(catalog)
+    out(`  (catalog: ${t} tools, ~${tokens} tokens)`)
+    process.exitCode = 1
+  } else {
+    const { tools: t, tokens } = totals(catalog)
+    out(`doctor: all ${servers.length} upstream(s) healthy — ${t} tools, ~${tokens} tokens of schema compacted behind ${Object.keys(groups).length} batch(es)`)
+  }
+  pool.closeAll()
+}
+
+function cmdReport(args: CliArgs): void {
+  const dir = resolveConfigDir(str(args.config))
+  const cfg = loadConfig(dir)
+  const metrics = new Metrics(path.join(dir, "metrics.jsonl"))
+  const windowMs = args.days ? Number(args.days) * 86_400_000 : 0
+  const lines = reportLines(metrics.read(), { windowMs })
+  out(lines.join("\n"))
+}
+
+async function cmdServe(args: CliArgs): Promise<void> {
+  const dir = resolveConfigDir(str(args.config))
+  const cfg = loadConfig(dir)
+  const workdir = args.workdir ? path.resolve(str(args.workdir) as string) : process.cwd()
+  const pool = buildPool(cfg, { log: (m) => err(`[tcc] ${m}`), workdir })
+
+  let catalog = readCache(str(args.cache) || defaultCachePath())
+  let groups: Record<string, GroupConfig> | null = Object.keys(cfg.groups || {}).length ? cfg.groups : null
+
+  if (!catalog || !groups) {
+    err("[tcc] no cached catalog — snapshotting upstreams before serving")
+    catalog = await snapshot(pool, {
+      log: (m) => err(`[tcc] ${m}`),
+      concurrency: 6,
+      onResult: (name, entry) => err(`[tcc]   ${entry.ok ? "ok  " : "FAIL"} ${name} (${entry.tools?.length || 0} tools)`),
+    })
+    writeCache(catalog, str(args.cache) || defaultCachePath())
+    groups = groups || autoGroups(catalog)
+  }
+
+  const metrics = new Metrics(path.join(dir, "metrics.jsonl"))
+  const compactor = new Compactor({ config: cfg, pool, catalog, groups, metrics, log: (m) => err(`[tcc] ${m}`) })
+  const shutdown = async (): Promise<void> => {
+    await compactor.shutdown()
+    process.exit(0)
+  }
+  process.on("SIGINT", shutdown)
+  process.on("SIGTERM", shutdown)
+  await compactor.serve()
+}
+
+async function cmdBootstrap(args: CliArgs): Promise<void> {
+  const dir = resolveConfigDir(str(args.config))
+  const harness = str(args.harness) || "opencode"
+  const cfg = loadConfig(dir)
+  const detected = detectHarnesses({ only: [harness] })
+  const servers = Object.fromEntries(Object.entries(detected.servers).filter(([name]) => name !== "compactor"))
+  const count = Object.keys(servers).length
+  if (!count) {
+    out(`no MCP servers found in ${HARNESSES[harness]?.label || harness} — nothing to compact`)
+    return
+  }
+  cfg.mcp = servers
+  const pool = buildPool(cfg, { log: (m) => err(`  ${m}`) })
+  err("snapshotting tools…")
+  const catalog = await snapshot(pool, {
+    log: (m) => err(`  ! ${m}`),
+    onResult: (name, entry) => err(`  ${entry.ok ? "✓" : "✗"} ${name.padEnd(24)} ${entry.ok ? `${entry.tools.length} tools` : entry.error}`),
+  })
+  pool.closeAll()
+  writeCache(catalog, cfg.cachePath || defaultCachePath())
+  cfg.groups = autoGroups(catalog)
+  if (args.builtins) cfg.builtins = { enabled: true, tools: DEFAULT_BUILTINS, workdir: process.cwd() }
+  saveConfig(cfg, { backup: true })
+
+  const cliPath = path.resolve(__dirname, "../bin/tcc.js")
+  const result = installIntoHarness(harness, {
+    command: "node",
+    args: [cliPath, "serve", "--config", dir],
+    removeServers: Object.keys(servers),
+  })
+  const { tools, tokens } = totals(catalog)
+  out("")
+  out(`compacted ${count} servers (${tools} tools, ~${tokens} tokens) into ${Object.keys(cfg.groups).length} groups`)
+  if (result.toml) {
+    out("")
+    out(`${HARNESSES[harness].label} uses TOML — add this to ${result.path}:`)
+    out("")
+    out("  [mcp_servers.compactor]")
+    out('  command = "node"')
+    out(`  args = ["${cliPath}", "serve", "--config", "${dir}"]`)
+  } else {
+    out(`wrote ${result.path} (backup: ${result.path}.bak-tcc)`)
+    out(`  removed ${result.removed} server definitions, added "compactor"`)
+  }
+  out("")
+  out(`config: ${configPath(dir)}`)
+  out("Restart the harness so it picks up the new tool list.")
+}
+
+function cmdInstall(args: CliArgs): void {
+  const dir = resolveConfigDir(str(args.config))
+  const cfg = loadConfig(dir)
+  const harness = str(args.harness)
+  if (!harness) {
+    out(`--harness is required. Known: ${Object.keys(HARNESSES).join(", ")}`)
+    process.exitCode = 1
+    return
+  }
+  const cliPath = path.resolve(__dirname, "../bin/tcc.js")
+  const remove = args.remove === undefined ? Object.keys(cfg.mcp || {}) : args.remove === true ? [] : String(args.remove).split(",").map((s) => s.trim())
+  const result = installIntoHarness(harness, {
+    command: str(args.command) || "node",
+    args: [cliPath, "serve", "--config", dir],
+    serverName: str(args.serverName) || "compactor",
+    removeServers: remove,
+  })
+  if (result.toml) {
+    out(`Add this to ${result.path}:`)
+    out("")
+    out("  [mcp_servers.compactor]")
+    out(`  command = "${str(args.command) || "node"}"`)
+    out(`  args = ["${cliPath}", "serve", "--config", "${dir}"]`)
+    return
+  }
+  out(`wrote ${result.path} (backup: ${result.path}.bak-tcc)`)
+  out(`removed ${result.removed} server definitions, added "${result.wrote}"`)
+  out("")
+  out("Restart the harness so it picks up the new tool list.")
+}
+
+/** Prove the built-ins work: run each one against a scratch directory and check
+ *  the observable result, not that a function returned. */
+async function cmdSelftest(): Promise<void> {
+  const fs = await import("node:fs")
+  const os = await import("node:os")
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tcc-selftest-"))
+  const up = new BuiltinUpstream({ cwd: dir, tools: Object.keys(BUILTINS) })
+  const fails: string[] = []
+  const check = (name: string, condition: unknown, detail = ""): void => {
+    out(`${condition ? "ok  " : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`)
+    if (!condition) fails.push(name)
+  }
+  const text = (r: McpCallToolResult): string => r.content.map((c: McpContentBlock) => (typeof c.text === "string" ? c.text : "")).join("\n")
+
+  let r = await up.callTool("write", { filePath: "src/hello.txt", content: "alpha\nbeta\ngamma\n" })
+  check("write creates parent directories", existsSync(path.join(dir, "src/hello.txt")), text(r))
+
+  r = await up.callTool("read", { filePath: "src/hello.txt", offset: 2, limit: 2 })
+  check("read returns numbered lines", /2→beta/.test(text(r)), text(r).split("\n")[1])
+
+  r = await up.callTool("edit", { filePath: "src/hello.txt", oldString: "beta", newString: "BETA" })
+  check("edit replaces text", fs.readFileSync(path.join(dir, "src/hello.txt"), "utf8").includes("BETA"), text(r))
