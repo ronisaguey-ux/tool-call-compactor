@@ -958,3 +958,101 @@ export class Compactor {
 
     if (description) {
       // Deliberately not truncated: whoever is writing this knows what the batch
+      // is for, and the index is theirs to spend. The range is advice only.
+      const words = wordCount(String(description))
+      this.groups[id].description = String(description).trim()
+      notes.push(
+        `${words} words${
+          outsideRecommended(words)
+            ? ` — ${WORDS_RECOMMENDED[0]}–${WORDS_RECOMMENDED[1]} measures best, but nothing was trimmed`
+            : ""
+        }`,
+      )
+    }
+
+    this.config.groups = this.config.groups || {}
+    this.config.groups[id] = { ...(this.config.groups[id] || {}), ...this.groups[id] }
+    let saved: string | null = null
+    try {
+      saved = saveConfig(this.config)
+    } catch (err) {
+      this.log(`could not persist batch: ${(err as Error).message}`)
+    }
+    this.advertisedRevision += 1
+    Promise.resolve(this.mcp.sendToolListChanged?.()).catch((err: Error) =>
+      this.log(`tool list changed notification failed: ${err.message}`),
+    )
+    this.recordAdvertised()
+    return this.text(
+      `Updated "${id}" (${this.groups[id].title || titleFor(id)}): ${this.groups[id].description}\n` +
+        `${notes.join("; ")}${saved ? `; saved to ${saved}` : "; not persisted"}`,
+    )
+  }
+
+  // ------------------------------------------------------------------ control
+
+  /** A localhost control port so `tcc report` and `tcc refresh` work against a
+   *  server that is already running inside a harness. */
+  startControl(): http.Server | null {
+    const control = this.options.control || defaultControl()
+    if (control.enabled === false) return null
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url as string, `http://${req.headers.host || "127.0.0.1"}`)
+      const token = control.token
+      if (token && req.headers["x-tcc-token"] !== token) {
+        res.writeHead(401, { "content-type": "application/json" })
+        res.end(JSON.stringify({ error: "unauthorized" }))
+        return
+      }
+      const send = (code: number, body: unknown): void => {
+        res.writeHead(code, { "content-type": "application/json" })
+        res.end(JSON.stringify(body, null, 2))
+      }
+      if (url.pathname === "/healthz") return send(200, { ok: true, uptimeMs: Date.now() - this.startedAt })
+      if (url.pathname === "/stats") {
+        return send(200, {
+          uptimeMs: Date.now() - this.startedAt,
+          groups: Object.keys(this.groups).length,
+          indexedTools: this.index.size,
+          persist: this.policy,
+          registered: [...this.registered],
+          pinned: [...this.pinned],
+          exposed: [...this.dynamic.keys()],
+          upstreams: this.pool.stats(),
+          advertised: this.toolList().length,
+        })
+      }
+      if (url.pathname === "/groups") return send(200, this.groups)
+      if (url.pathname === "/report") {
+        return send(200, { lines: reportLines(this.metrics?.read() || []) })
+      }
+      return send(404, { error: "not found", paths: ["/healthz", "/stats", "/groups", "/report"] })
+    })
+    server.on("error", (err: Error) => this.log(`control port unavailable: ${err.message}`))
+    server.listen(control.port ?? 4750, control.host || "127.0.0.1", () => {
+      this.log(`control listening on http://${control.host || "127.0.0.1"}:${control.port ?? 4750}`)
+    })
+    this.control = server
+    return server
+  }
+
+  async serve(transport: StdioServerTransport = new StdioServerTransport()): Promise<void> {
+    this.recordAdvertised()
+    await this.mcp.connect(transport)
+    this.startControl()
+    this.log(`serving ${this.toolList().length} tools for ${this.pool.names().length} upstreams`)
+  }
+
+  async shutdown(): Promise<void> {
+    this.pool.closeAll()
+    try {
+      this.control?.close()
+    } catch {
+      // shutting down anyway
+    }
+  }
+}
+
+function defaultControl(): ResolvedConfig["options"]["control"] {
+  return { enabled: true, host: "127.0.0.1", port: 4750, token: null }
+}
