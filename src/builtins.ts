@@ -318,3 +318,104 @@ export const BUILTINS: Record<string, BuiltinTool> = {
           content = readFileSync(file, "utf8")
         } catch {
           continue
+        }
+        const lines = content.split("\n")
+        for (let i = 0; i < lines.length; i++) {
+          if (re.test(lines[i])) {
+            hits.push(`${file}:${i + 1}: ${lines[i].slice(0, 300)}`)
+            if (hits.length >= max) break
+          }
+        }
+        if (hits.length >= max) break
+      }
+      if (!hits.length) return ok(`no matches for ${pattern} in ${target}`)
+      return ok(`${hits.length} matching lines\n${hits.join("\n")}`)
+    },
+  },
+
+  webfetch: {
+    definition: {
+      name: "webfetch",
+      description: "Fetch a URL over HTTP and return the response body as text or markdown-stripped content.",
+      inputSchema: schema({
+        url: { type: "string", description: "Absolute URL to fetch." },
+        format: { type: "string", enum: ["text", "html"], description: "text strips HTML tags (default), html returns raw." },
+      }, ["url"]),
+    },
+    async run(args, ctx) {
+      if (!args?.url) return fail("webfetch needs a url")
+      let url: URL
+      try {
+        url = new URL(args.url as string)
+      } catch {
+        return fail(`not a valid URL: ${args.url}`)
+      }
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), ctx.timeoutMs || 30_000)
+      try {
+        const res = await fetch(url, {
+          signal: controller.signal,
+          redirect: "follow",
+          headers: { "user-agent": "tool-call-compactor/0.1 (+https://github.com/ronisaguey-ux/tool-call-compactor)" },
+        })
+        const body = await res.text()
+        const type = res.headers.get("content-type") || ""
+        const text = args.format === "html" || !type.includes("html") ? body : stripHtml(body)
+        return ok(`${res.status} ${res.statusText} ${url}\n${clamp(text)}`)
+      } catch (err) {
+        return fail(`fetch failed: ${(err as Error).message}`)
+      } finally {
+        clearTimeout(timer)
+      }
+    },
+  },
+}
+
+export const DEFAULT_BUILTINS = ["bash", "read", "write", "edit", "glob", "grep", "webfetch"]
+
+/** Which built-ins a harness exposes under other names, so a group can hide the
+ *  real ones. Used by `tcc init --builtins`. */
+export const HARNESS_BUILTIN_NAMES: Record<string, Record<string, string>> = {
+  opencode: { bash: "bash", read: "read", write: "write", edit: "edit", glob: "glob", grep: "grep", webfetch: "webfetch" },
+  "claude-code": { bash: "Bash", read: "Read", write: "Write", edit: "Edit", glob: "Glob", grep: "Grep", webfetch: "WebFetch" },
+  codex: { bash: "shell", read: "read_file", write: "write_file", edit: "apply_patch", glob: "list_files", grep: "search" },
+  hermes: { bash: "bash", read: "read", write: "write", edit: "edit", glob: "glob", grep: "grep" },
+}
+
+/** An upstream-shaped view of the built-ins, so they can sit in the same pool as
+ *  MCP servers and be grouped, fetched and called the same way. */
+export class BuiltinUpstream {
+  name: string
+  enabled: string[]
+  cwd: string
+  timeoutMs: number
+  log: Logger
+  client: { connected: boolean }
+  stats: UpstreamStats
+
+  constructor({ tools = DEFAULT_BUILTINS, cwd = process.cwd(), timeoutMs = 120_000, log = () => {} }: { tools?: string[]; cwd?: string; timeoutMs?: number; log?: Logger } = {}) {
+    this.name = "builtin"
+    this.enabled = tools.filter((t) => BUILTINS[t])
+    this.cwd = cwd
+    this.timeoutMs = timeoutMs
+    this.log = log
+    this.client = { connected: true }
+    this.stats = { calls: 0, errors: 0, spawns: 0, lastUsed: 0 }
+  }
+
+  async listTools(): Promise<McpToolSchema[]> {
+    return this.enabled.map((name) => BUILTINS[name].definition)
+  }
+
+  async callTool(name: string, args?: Record<string, unknown>): Promise<McpCallToolResult> {
+    const tool = BUILTINS[name]
+    if (!tool) throw new Error(`unknown built-in tool: ${name}`)
+    this.stats.calls += 1
+    this.stats.lastUsed = Date.now()
+    const result = await tool.run(args || {}, { cwd: this.cwd, timeoutMs: this.timeoutMs, env: {} })
+    if (result?.isError) this.stats.errors += 1
+    return result
+  }
+
+  close(): void {}
+}
