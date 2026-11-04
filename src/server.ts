@@ -318,3 +318,323 @@ export class Compactor {
     this.exposedByKey = new Map() // "server::tool" -> exposed name
     this.registered = new Set() // batches whose tools are in the tool list now
     this.pinned = new Set() // batches kept live by the persist policy
+    this.advertisedRevision = 0
+    this.lastRecordedRevision = -1
+    this.startedAt = Date.now()
+    // The briefing counts what the agent cannot see, so it has to be computed
+    // before the Server exists — `exposedByKey` is not filled in until
+    // syncExposed runs below.
+    const exposedGroups = Object.values(this.groups).filter((group) => group.expose)
+    const exposedTools = exposedGroups.reduce(
+      (n, group) => n + toolsInGroup(group, this.catalog, this.index).length,
+      0,
+    )
+    this.mcp = new Server(
+      { name: "tool-call-compactor", version: VERSION },
+      {
+        capabilities: { tools: { listChanged: true } },
+        instructions: instructionsFor(this.policy, {
+          batches: Object.keys(this.groups).length - exposedGroups.length,
+          tools: Math.max(0, this.index.size - exposedTools),
+          // Counted from the index, not the config: an agent asking "how many
+          // servers are behind this" cares about what is reachable.
+          servers: new Set([...this.index.values()].map((tool) => tool.server)).size,
+        }),
+      },
+    )
+    this.registerHandlers()
+    // Pass-through batches are live from here on, before any request arrives —
+    // that is what keeps the advertised tool list identical on request one.
+    this.syncExposed()
+  }
+
+  // ---------------------------------------------------------------- tool list
+
+  groupToolCount(id: string): number {
+    const group = this.groups[id]
+    if (!group) return 0
+    if (this.index.size) return toolsInGroup(group, this.catalog, this.index).length
+    return group.declaredCount || 0
+  }
+
+  coreToolList(): McpToolSchema[] {
+    return CORE_TOOLS.map((t) => ({ ...t }))
+  }
+
+  /** A batch marked `expose: true` is pass-through: its tools are advertised as
+   *  real tools from the very first request instead of hiding behind a fetch.
+   *  Registering at boot rather than on demand is the point — the tool list is
+   *  then byte-identical on every request, which is what a provider's prefix
+   *  cache needs to keep hitting. */
+  syncExposed(): void {
+    for (const [id, group] of Object.entries(this.groups)) {
+      if (!group?.expose || this.registered.has(id)) continue
+      const tools = this.index.size ? toolsInGroup(group, this.catalog, this.index) : []
+      if (!tools.length) {
+        this.log(`batch "${id}" is expose:true but has no catalogued tools — run \`tcc scan\` to snapshot them`)
+        continue
+      }
+      this.registerGroup(id, tools)
+    }
+  }
+
+  /** The name a batch's tool takes once it is registered. Two servers can share
+   *  a tool name, and MCP names must be unique, so the server is folded in for
+   *  the ones that clash. */
+  exposedName(groupId: string, tool: IndexedTool, counts?: Map<string, number>): string {
+    return (counts?.get(tool.name) as number) > 1 ? `${groupId}__${tool.server}__${tool.name}` : `${groupId}__${tool.name}`
+  }
+
+  registerGroup(id: string, tools: IndexedTool[]): number {
+    const counts = new Map<string, number>()
+    for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) || 0) + 1)
+    let added = 0
+    for (const tool of tools) {
+      const exposed = this.exposedName(id, tool, counts)
+      if (this.dynamic.has(exposed)) continue
+      this.dynamic.set(exposed, { group: id, server: tool.server, tool: tool.name })
+      this.exposedByKey.set(`${tool.server}::${tool.name}`, exposed)
+      added += 1
+    }
+    if (added) this.registered.add(id)
+    return added
+  }
+
+  groupToolList(): McpToolSchema[] {
+    const out: McpToolSchema[] = []
+    for (const [id, group] of Object.entries(this.groups)) {
+      if (this.registered.has(id)) continue // already live as real tools; a fetch tool would be dead weight
+      const count = this.groupToolCount(id)
+      const title = group.title || titleFor(id)
+      out.push({
+        name: `see_tools_${id}`,
+        description: `${title}: ${group.description} — fetch these ${count || ""} tool schemas.`.replace(/\s+/g, " ").trim(),
+        inputSchema: { type: "object", properties: { ...FETCH_PROPERTIES }, additionalProperties: false },
+      })
+    }
+    return out
+  }
+
+  dynamicToolList(): McpToolSchema[] {
+    const out: McpToolSchema[] = []
+    for (const [exposed, entry] of this.dynamic) {
+      const tool = this.index.get(`${entry.server}::${entry.tool}`)
+      out.push({
+        name: exposed,
+        description: tool?.description || `${entry.tool} on ${entry.server}.`,
+        inputSchema: clampSchema(tool?.inputSchema || { type: "object", properties: {} }),
+        ...(tool?.annotations ? { annotations: tool.annotations } : {}),
+      })
+    }
+    return out
+  }
+
+  toolList(): McpToolSchema[] {
+    this.syncExposed()
+    return [...this.coreToolList(), ...this.groupToolList(), ...this.dynamicToolList()]
+  }
+
+  /** Record what the harness was actually sent. Called from the list-tools
+   *  handler, so the number in the report is the number that went on the wire. */
+  recordAdvertised(): { tools: number; tokens: number; hiddenTools: number; hiddenTokens: number } {
+    this.lastRecordedRevision = this.advertisedRevision
+    const tools = this.toolList()
+    const tokens = tools.reduce((n, t) => n + estimateTokens(t), 0)
+    let hiddenTools = 0
+    let hiddenTokens = 0
+    for (const [key, tool] of this.index) {
+      if (this.exposedByKey.has(key)) continue
+      hiddenTools += 1
+      hiddenTokens += tool.tokens || estimateTokens(tool)
+    }
+    this.metrics?.record("advertised", {
+      tools: tools.length,
+      tokens,
+      bytes: JSON.stringify(tools).length,
+      hiddenTools,
+      hiddenTokens,
+      periodStart: this.startedAt,
+      servers: this.pool.names().length,
+    })
+    return { tools: tools.length, tokens, hiddenTools, hiddenTokens }
+  }
+
+  /** Announce a changed tool list. There is no client capability to check:
+   *  tools.listChanged is something a *server* announces, and clients never
+   *  declare it. A client that ignores the notification simply never sees the
+   *  extra tools and keeps using call_tool, which still works — so announcing is
+   *  always safe. */
+  async notifyToolList(): Promise<void> {
+    this.advertisedRevision += 1
+    try {
+      await this.mcp.sendToolListChanged()
+    } catch (err) {
+      this.log(`tool list changed notification failed: ${(err as Error).message}`)
+    }
+    this.recordAdvertised()
+  }
+
+  /** The persist policy, applied to one fetched batch: does its schema come back
+   *  to live in the tool list for the rest of the session?
+   *
+   *  - `off`   — never; the agent keeps going through call_tool.
+   *  - `auto`  — yes, while the batch stays inside `persistBudget`.
+   *  - `agent` — only when the agent asked (`persist: true` / `persist_group`).
+   *
+   *  An explicit request outranks the budget: the agent has seen the cost and
+   *  decided. `persist: false` is an explicit un-registration. */
+  async maybeExpose(groupId: string, tools: IndexedTool[], { persist }: { persist?: unknown } = {}): Promise<ExposeOutcome> {
+    if (persist === false) return this.unregisterGroup(groupId)
+    if (this.registered.has(groupId)) return { exposed: 0, reason: "already" }
+    const asked = persist === true || this.pinned.has(groupId)
+    if (this.policy.mode === "off") return { exposed: 0, reason: "persist-off" }
+    if (this.policy.mode === "agent" && !asked) return { exposed: 0, reason: "agent-decides" }
+    const cost = tools.reduce((n, t) => n + (t.tokens || estimateTokens(t)), 0)
+    if (!asked && this.policy.budget > 0 && cost > this.policy.budget) {
+      return { exposed: 0, reason: "over-budget", cost, budget: this.policy.budget }
+    }
+    const added = this.registerGroup(groupId, tools)
+    // `pinned` means "kept live by this session" as opposed to a batch the
+    // config marks `expose: true`, which is live in every session.
+    this.pinned.add(groupId)
+    if (added) await this.notifyToolList()
+    return { exposed: added, reason: "registered", cost }
+  }
+
+  async unregisterGroup(groupId: string): Promise<ExposeOutcome> {
+    let removed = 0
+    for (const [exposed, entry] of [...this.dynamic]) {
+      if (entry.group !== groupId) continue
+      this.dynamic.delete(exposed)
+      this.exposedByKey.delete(`${entry.server}::${entry.tool}`)
+      removed += 1
+    }
+    this.registered.delete(groupId)
+    this.pinned.delete(groupId)
+    if (removed) await this.notifyToolList()
+    return { exposed: 0, removed, reason: "unregistered" }
+  }
+
+  // ----------------------------------------------------------------- handlers
+
+  registerHandlers(): void {
+    this.mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+      if (this.lastRecordedRevision !== this.advertisedRevision) this.recordAdvertised()
+      // The SDK pins `inputSchema.type` to the literal "object"; MCP carries a
+      // schema through verbatim, which is what this list holds.
+      return { tools: this.toolList() } as unknown as ListToolsResult
+    })
+    this.mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params
+      try {
+        return (await this.dispatch(name, args || {})) as unknown as CallToolResult
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        this.log(`tool ${name} failed: ${message}`)
+        return { content: [{ type: "text", text: `Error: ${message}` }], isError: true }
+      }
+    })
+  }
+
+  async dispatch(name: string, args: Record<string, unknown>): Promise<McpTextReply> {
+    const entry = this.dynamic.get(name)
+    if (entry) return this.invokeDynamic(entry, args)
+    switch (name) {
+      case "list_groups":
+        return this.tListGroups(args)
+      case "search_tools":
+        return this.tSearchTools(args)
+      case "call_tool":
+      case "run_tool":
+        return this.tCallTool(args)
+      case "describe_group":
+        return this.tDescribeGroup(args)
+      case "persist_group":
+      case "pin_group":
+        return this.tPersistGroup(args)
+      case "fetch_group":
+        return this.tFetchGroup(args.group, args)
+      default: {
+        // Checked before see_tools_<group>, which would otherwise read the
+        // "persistent_" part as a batch id.
+        const persistent = name.match(/^see_tools?_persistent?_(.+)$/)
+        if (persistent) return this.tPersistGroup({ ...args, group: persistent[1], persist: args.persist ?? true })
+        // see_tools_<group> is the advertised name; see_tool_<group> is accepted
+        // too, because that is the spelling everyone types first.
+        const scoped = name.match(/^see_tools?_(.+)$/)
+        if (scoped) return this.tFetchGroup(scoped[1], args)
+        throw new Error(`unknown tool: ${name}`)
+      }
+    }
+  }
+
+  text(body: string): McpTextReply {
+    const block: McpTextContent = { type: "text", text: body }
+    return { content: [block] }
+  }
+
+  groupLine(id: string): string {
+    const group = this.groups[id]
+    const count = this.groupToolCount(id)
+    const status = !this.registered.has(id) ? "" : this.pinned.has(id) ? " [pinned live]" : " [live]"
+    return `${describeLine(id, group, count)}${status}${group.servers?.length ? ` [${group.servers.join(", ")}]` : ""}`
+  }
+
+  /** The names inside a batch. This is the recall fix: a description is prose and
+   *  can miss a capability the agent needed, but a name is the exact word it is
+   *  looking for. Names belong here rather than in the prefix — a tool result is
+   *  history and costs nothing per request. */
+  toolNames(id: string): string[] {
+    const group = this.groups[id]
+    if (!group) return []
+    return toolsInGroup(group, this.catalog, this.index)
+      .map((tool) => tool.name)
+      .sort()
+  }
+
+  namesLine(id: string, limit = 14): string | null {
+    const names = this.toolNames(id)
+    if (!names.length) return null
+    const shown = names.slice(0, limit)
+    const more = names.length - shown.length
+    return `        ${shown.join(", ")}${more > 0 ? `, +${more} more — list_groups {group: "${id}"}` : ""}`
+  }
+
+  tGroupDetail(rawId: unknown): McpTextReply {
+    const found = findGroup(this.groups, rawId)
+    if (!found) {
+      const ids = Object.keys(this.groups)
+      return this.text(`Unknown batch "${String(rawId)}". Available: ${ids.join(", ") || "(none)"}`)
+    }
+    const { id, group } = found
+    const tools = toolsInGroup(group, this.catalog, this.index)
+    const words = wordCount(group.description || "")
+    const lines: Array<string | null> = [
+      `"${id}" — ${group.title}`,
+      group.description || "(no description yet)",
+      `${tools.length} tool${tools.length === 1 ? "" : "s"}` +
+        (group.expose ? " · pass-through, already in your tool list" : "") +
+        (group.servers?.length ? ` · servers: ${group.servers.join(", ")}` : ""),
+      "",
+      ...tools.map((t) => `  ${t.server}::${t.name}${t.description ? ` — ${clampWords(t.description, 14)}` : ""}`),
+      "",
+      group.expose
+        ? `These are live as ${id}__<tool>; call them directly.`
+        : `Fetch the schemas with see_tools_${id}, then run one with call_tool.`,
+      outsideRecommended(words)
+        ? `This description is ${words} words; ${WORDS_RECOMMENDED[0]}–${WORDS_RECOMMENDED[1]} measures best. describe_group can rewrite it.`
+        : null,
+    ]
+    return this.text(lines.filter((line) => line !== null).join("\n"))
+  }
+
+  tListGroups({ group }: ListGroupsArgs = {}): McpTextReply {
+    if (group) return this.tGroupDetail(group)
+    const ids = Object.keys(this.groups)
+    if (!ids.length) {
+      return this.text(
+        "No groups are configured and no servers were detected. Add servers to tcc.config.json, then run `tcc init`.",
+      )
+    }
+    const live = [...this.registered]
+    const hidden = [...this.index.keys()].filter((key) => !this.exposedByKey.has(key)).length
