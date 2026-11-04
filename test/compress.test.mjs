@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { clampSchema, compressResult, truncateText } from "../src/compress.js"
+import { clampSchema, compressResult, truncateText } from "../dist/compress.js"
 
 const textResult = (text) => ({ content: [{ type: "text", text }] })
 

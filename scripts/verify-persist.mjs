@@ -12,7 +12,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js"
 import path from "node:path"
-import { loadConfig, resolveConfigDir } from "../src/config.js"
+import { loadConfig, resolveConfigDir } from "../dist/config.js"
 
 const argOf = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`)
