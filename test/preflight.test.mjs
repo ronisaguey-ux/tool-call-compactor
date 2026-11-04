@@ -5,7 +5,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { preflightUpstreams } from "../src/cli.js"
+import { preflightUpstreams } from "../dist/cli.js"
 
 test("an unresolved placeholder is named, not left to look like a dead server", () => {
   const p = preflightUpstreams({ mcp: { a: { command: ["node", "{env:KIT_DIR}/x.js"] } } })

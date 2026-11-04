@@ -1,5 +1,8 @@
 node_modules/
 
+# Build output: `npm run build` writes it from src/ (and `npm install` does via prepare).
+dist/
+
 # Local state: never commit a real config — it names your servers, and their
 # definitions can carry tokens.
 tcc.config.json
